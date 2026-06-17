@@ -1,0 +1,20 @@
+version: "3.9"
+
+services:
+  export:
+    build: .
+    volumes:
+      - ./artifacts:/workspace/artifacts
+      - ./examples:/workspace/examples
+    command: >
+      --model examples.tiny_model:create_model
+      --example-input examples.tiny_model:create_example_input
+      --out /workspace/artifacts/tiny
+
+  test:
+    build: .
+    volumes:
+      - ./src:/workspace/src
+      - ./tests:/workspace/tests
+    entrypoint: python -m pytest
+    command: tests/ -v
