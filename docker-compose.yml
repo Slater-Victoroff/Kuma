@@ -7,9 +7,8 @@ services:
       - ./artifacts:/workspace/artifacts
       - ./examples:/workspace/examples
     command: >
-      --model examples.tiny_model:create_model
-      --example-input examples.tiny_model:create_example_input
-      --out /workspace/artifacts/tiny
+      --out /workspace/artifacts/simple.iph
+      --out-dir /workspace/artifacts/simple
 
   test:
     build: .
@@ -18,3 +17,21 @@ services:
       - ./tests:/workspace/tests
     entrypoint: python -m pytest
     command: tests/ -v
+
+  bart-test:
+    build: ./kuma-bart
+    volumes:
+      - ./kuma-bart/src:/workspace/src
+      - ./kuma-bart/test:/workspace/test
+      - ./kuma-bart/demo:/workspace/demo
+    command: npm run test
+
+  bart-demo:
+    build: ./kuma-bart
+    volumes:
+      - ./kuma-bart/src:/workspace/src
+      - ./kuma-bart/demo:/workspace/demo
+      - ./artifacts:/workspace/demo/artifacts:ro
+    ports:
+      - "5173:5173"
+    command: npm run demo

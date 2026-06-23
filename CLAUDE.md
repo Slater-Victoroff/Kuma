@@ -1,6 +1,12 @@
-# Kuma — iphso-webgpu-export
+# Kuma
 
-PyTorch → WebGPU graph capture and weight packing library (Step 1 of a Torch→WebGPU compiler).
+PyTorch `torch.export` → `.iph` compiler/exporter (Step 1 of a Torch→WebGPU compiler).
+
+Kuma captures a PyTorch inference graph, packs its weights, and bundles everything into a
+self-contained `.iph` package (a zip: `manifest.json`, `weights.f32.bin`, `kernels/*.wgsl`,
+`debug_report.md`). Kuma is not a runtime, not a training library, and not a WebGPU framework —
+the `.iph` file is the contract between this compiler and the (separate) WebGPU runtime that
+will eventually execute it.
 
 ## Environment
 
@@ -11,7 +17,7 @@ All Python execution, testing, and validation must happen inside Docker.
 # Build image
 docker compose build
 
-# Run the acceptance test (tiny_model export)
+# Run the acceptance test (simple model export → artifacts/simple.iph + artifacts/simple/)
 docker compose run --rm export
 
 # Run the full test suite
@@ -36,16 +42,17 @@ Artifacts land in `./artifacts/` (bind-mounted at `/workspace/artifacts` in the 
 2. Then do a manual acceptance run to read the artifacts:
    ```bash
    docker compose run --rm export \
-     --model examples.tiny_model:create_model \
-     --example-input examples.tiny_model:create_example_input \
-     --out /workspace/artifacts/tiny
+     --out /workspace/artifacts/simple.iph \
+     --out-dir /workspace/artifacts/simple
    ```
 
 Spot-check the output:
-- `artifacts/tiny/debug_report.md` — ops table, weight table, unsupported ops
-- `artifacts/tiny/manifest.json` — full bundle descriptor; `byte_offset + byte_length` must be consistent
-- `artifacts/tiny/weights.f32.bin` — size should match sum of `byte_length` fields in manifest
-- `artifacts/tiny/exported_graph.json` — raw FX node list with `weight_name` on parameter placeholders
+- `artifacts/simple.iph` — the self-contained package (zip); should contain `manifest.json`,
+  `weights.f32.bin`, `kernels/*.wgsl`, `debug_report.md`
+- `artifacts/simple/debug_report.md` — ops table, weight table, unsupported ops
+- `artifacts/simple/manifest.json` — full bundle descriptor; `byte_offset + byte_length` must be consistent
+- `artifacts/simple/weights.f32.bin` — size should match sum of `byte_length` fields in manifest
+- `artifacts/simple/exported_graph.json` — raw FX node list with `weight_name` on parameter placeholders (debug-dir only; not part of the `.iph` contract since the manifest already embeds the graph)
 
 ## Using with a real Niko/Nika model (from another container)
 
@@ -68,37 +75,56 @@ pip install -e /kuma
 pip install git+https://github.com/yourorg/kuma.git
 ```
 
-**Adapter file in your model repo:**
+**Direct Python API (the only entry point — there is no CLI):**
 
-Write a thin `export_adapter.py` alongside your model code:
 ```python
-# mymodel/export_adapter.py
 import torch
-from mymodel.build import build_model   # your existing factory
+import kuma
 
-def create_model():
-    model = build_model(cfg)            # fill in your config however you do it
-    model.eval()
-    return model
+model = build_model(cfg)
+model.eval()
+example_inputs = (torch.randn(1, 3, 512, 512),)
 
-def create_example_input():
-    # match the exact input shape/dtype your model expects
-    return (torch.randn(1, 3, 512, 512),)
+kuma.export_model(model, example_inputs, out="model.iph")
 ```
 
-Then run:
-```bash
-python -m iphso_webgpu_export.cli \
-  --model mymodel.export_adapter:create_model \
-  --example-input mymodel.export_adapter:create_example_input \
-  --out /artifacts/mymodel
+or, starting from an already-captured `ExportedProgram`:
+
+```python
+ep = torch.export.export(model.eval(), example_inputs)
+kuma.export_exported_program(ep, out="model.iph")
+```
+
+or, for lower-level access to the in-memory package before writing it out:
+
+```python
+package = kuma.compile(ep)
+package.save("model.iph")        # self-contained .iph zip
+package.write_dir("debug/")      # loose files for inspection
+```
+
+**Wiring up an existing model repo:**
+
+Write a thin `export.py` alongside your model code that calls the API directly:
+```python
+# mymodel/export.py
+import torch
+import kuma
+from mymodel.build import build_model   # your existing factory
+
+model = build_model(cfg)                # fill in your config however you do it
+model.eval()
+example_inputs = (torch.randn(1, 3, 512, 512),)  # match the exact input shape/dtype your model expects
+
+kuma.export_model(model, example_inputs, out="artifacts/mymodel.iph")
 ```
 
 ## Test suite layout
 
 ```
 tests/
-  conftest.py            # run_pipeline() fixture + shared assertion helpers
+  conftest.py            # run_pipeline() fixture (kuma.compile -> Package) + shared assertion helpers
+  test_package_iph.py    # .iph zip contract + top-level kuma.export_model/export_exported_program/compile API
   test_artifacts.py      # file existence, size consistency, JSON schema, roundtrip
   test_conv.py           # Conv2d variants, depthwise, 1×1, ConvTranspose2d
   test_linear.py         # Linear, MLP, channel-MLP via 1×1 conv
@@ -107,35 +133,50 @@ tests/
   test_residual.py       # plain skip, projected skip, bottleneck block
   test_convnext_block.py # full ConvNeXt block (closest to real Niko/Nika target)
   test_error_cases.py    # float16/non-cpu inputs rejected loudly
+  test_blocks.py         # SE block, encoder stage, tiny U-Net, multi-head output
+  test_concat.py         # torch.cat / skip-connection fusion patterns
+  test_depthwise_separable.py  # MobileNet-style depthwise-separable blocks
+  test_elementwise.py    # mul, sub, div, clamp, abs
+  test_multi_input.py    # multi-tensor model inputs
+  test_pooling.py        # MaxPool2d, AvgPool2d, AdaptiveAvgPool2d
+  test_shapes.py         # flatten, reshape, permute, transpose, squeeze/unsqueeze
+  test_upsample.py       # nn.Upsample, ConvTranspose2d, PixelShuffle
 ```
 
 ## Project layout
 
 ```
-src/iphso_webgpu_export/
-  cli.py          # Entry point: python -m iphso_webgpu_export.cli
-  export.py       # torch.export.export wrapper + validation
-  graph.py        # FX graph → exported_graph.json
-  pack_weights.py # Parameters/buffers → weights.f32.bin
-  manifest.py     # manifest.json builder
-  debug.py        # debug_report.md generator
+src/kuma/
+  __init__.py       # public API: export_model, export_exported_program, compile, Package
+  compiler.py       # compile(ep) -> Package; export_model/export_exported_program
+  export.py         # validation + torch.export.export wrapper (export_program)
+  graph.py          # FX graph → JSON-friendly dict (serialize_graph)
+  pack_weights.py   # Parameters/buffers → contiguous f32 blob (pack_weights)
+  manifest.py       # manifest dict builder (build_manifest)
+  debug.py          # debug report generator (generate_debug_report)
+  package_iph.py    # Package dataclass: .save() writes the .iph zip, .write_dir() writes loose files
+  kernels/          # embedded WGSL kernels — elementwise binary/unary ops, matmul/conv
+                     # (incl. transposed), reductions, norm (layer/batch/group), pooling
+                     # (max/avg/adaptive-avg), upsampling (nearest/bilinear), pixel-shuffle,
+                     # and shape ops (reshape/permute/concat/slice) — bundled into every
+                     # .iph package. See kernels/__init__.py for the full list.
 examples/
-  tiny_model.py   # Conv2d → GELU → Conv2d → residual add
-  export_tiny.py  # Convenience runner
-artifacts/        # git-ignored; created by the exporter at runtime
+  simple.py         # Conv2d → GELU → Conv2d → residual add (acceptance-test model)
+  export_simple.py  # Acceptance-test runner (Docker ENTRYPOINT for the `export` service)
+artifacts/          # git-ignored; created by the exporter at runtime
 ```
 
 ## Key constraints (Step 1 scope)
 
 - Inference only, static shapes, float32 only.
 - `torch.export.export` is the primary capture path.
-- No WGSL generation, no kernel fusion, no memory optimization yet.
+- WGSL kernels are embedded in every `.iph` package, but there is no WebGPU runtime yet to execute
+  them — no kernel fusion or memory/buffer planning yet.
 - Fail loudly on unsupported dtypes, non-CPU tensors, or dynamic shapes.
 - Target models: Conv/ConvNeXt/operator/decoder style (Niko/Nika family).
 
 ## What's next (Step 2+)
 
-- Op decompositions and ATen → WebGPU op lowering
-- WGSL kernel generation per op
-- Buffer planning / memory layout
-- WebGPU interpreter that consumes `manifest.json`
+- Op decompositions and ATen → WebGPU op lowering beyond the current kernel set
+- Buffer planning / memory layout, kernel fusion
+- A WebGPU interpreter (`@kuma/webgpu-runtime`) that consumes a `.iph` package

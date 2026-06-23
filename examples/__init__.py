@@ -1,1 +1,1 @@
-# namespace package — required so 'examples.tiny_model' resolves when CWD is on sys.path
+# namespace package — required so 'examples.simple' resolves when CWD is on sys.path

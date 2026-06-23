@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>kuma-bart demo</title>
+    <style>
+      body {
+        font-family: monospace;
+        max-width: 900px;
+        margin: 2rem auto;
+        padding: 0 1rem;
+      }
+      button {
+        font-size: 1rem;
+        padding: 0.5rem 1rem;
+      }
+      input[type="text"] {
+        font-family: monospace;
+        font-size: 1rem;
+        padding: 0.4rem;
+        width: 26rem;
+      }
+      pre {
+        background: #111;
+        color: #0f0;
+        padding: 1rem;
+        overflow-x: auto;
+        white-space: pre-wrap;
+      }
+      canvas {
+        border: 1px solid #444;
+        max-width: 100%;
+        background: repeating-conic-gradient(#ccc 0% 25%, #fff 0% 50%) 50% / 20px 20px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>kuma-bart</h1>
+    <p>BAd RunTime for Kuma — loads a <code>.iph</code> package and runs it via WebGPU.</p>
+    <p>Requires a WebGPU-capable browser (Chrome/Edge 113+).</p>
+    <p>
+      <label for="path">.iph path: </label>
+      <input id="path" type="text" value="/artifacts/3mbunny.iph" />
+    </p>
+    <button id="run">Load &amp; run</button>
+    <pre id="log">(idle)</pre>
+    <canvas id="frame"></canvas>
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>

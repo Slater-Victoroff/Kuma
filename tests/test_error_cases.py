@@ -6,7 +6,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from iphso_webgpu_export.export import run_export, _validate_inputs, _validate_parameters
+from kuma.export import export_program, _validate_inputs, _validate_parameters
 
 
 class _TinyFloat16(nn.Module):
@@ -37,16 +37,7 @@ def test_non_cpu_input_rejected():
         _validate_inputs((torch.randn(1, 4, 4, 4).cuda(),))
 
 
-def test_non_tuple_input_rejected(tmp_path):
-    with pytest.raises((TypeError, Exception)):
-        # Pass a list instead of tuple — should raise
-        from iphso_webgpu_export.export import _load_factory
-        import sys, types
-        # Inject a synthetic module with a bad factory
-        mod = types.ModuleType("_bad_input_test")
-        mod.bad_factory = lambda: [torch.randn(1, 3, 4, 4)]  # list, not tuple
-        sys.modules["_bad_input_test"] = mod
-        try:
-            run_export("_bad_input_test:bad_factory.__class__", "_bad_input_test:bad_factory", tmp_path)
-        finally:
-            del sys.modules["_bad_input_test"]
+def test_non_tuple_input_rejected():
+    model = nn.Conv2d(3, 3, 1)
+    with pytest.raises(TypeError, match="tuple"):
+        export_program(model, [torch.randn(1, 3, 4, 4)])  # list, not tuple

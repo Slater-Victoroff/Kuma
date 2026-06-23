@@ -19,4 +19,4 @@ COPY tests/ tests/
 
 VOLUME ["/workspace/artifacts"]
 
-ENTRYPOINT ["python", "-m", "iphso_webgpu_export.cli"]
+ENTRYPOINT ["python", "-m", "examples.export_simple"]

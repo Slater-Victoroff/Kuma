@@ -1,6 +1,6 @@
 """Artifact integrity tests: file existence, size consistency, schema validity.
 
-These run against the tiny_model fixture and catch regressions in the pipeline
+These run against a tiny fixture model and catch regressions in the pipeline
 itself rather than in any specific layer type.
 """
 
@@ -60,7 +60,7 @@ def test_manifest_schema(tiny_result):
 def test_manifest_json_is_valid_on_disk(tiny_result):
     raw = (tiny_result["out_dir"] / "manifest.json").read_text()
     parsed = json.loads(raw)
-    assert parsed["format"] == "iphso-webgpu-export"
+    assert parsed["format"] == "kuma"
 
 
 def test_exported_graph_json_is_valid(tiny_result):

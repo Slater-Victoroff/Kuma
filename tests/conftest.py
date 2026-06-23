@@ -1,19 +1,15 @@
-"""Shared fixtures for the iphso-webgpu-export test suite."""
+"""Shared fixtures for the Kuma test suite."""
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
-import pytest
 import torch
 import torch.nn as nn
 
-from iphso_webgpu_export.graph import write_graph
-from iphso_webgpu_export.pack_weights import write_weights
-from iphso_webgpu_export.manifest import write_manifest
-from iphso_webgpu_export.debug import write_debug_report
+from kuma.compiler import compile as kuma_compile
+from kuma.package_iph import Package
 
 
 def run_pipeline(
@@ -22,28 +18,30 @@ def run_pipeline(
     out_dir: Path,
 ) -> dict[str, Any]:
     """
-    Run the full export pipeline against a model and return a dict of all outputs.
+    Run the full compile pipeline against a model and return a dict of all outputs.
     This is the canonical test harness — tests should call this, not reimport internals.
+
+    Writes both the loose debug artifacts (for assert_artifacts_exist) and a model.iph
+    package into out_dir.
     """
-    out_dir.mkdir(parents=True, exist_ok=True)
     model.eval()
     with torch.no_grad():
         ep = torch.export.export(model, example_inputs)
 
-    graph_data = write_graph(ep, out_dir)
-    blob, weight_entries, skipped = write_weights(ep, out_dir)
-    warnings = [f"skipped non-float32 tensor: {s}" for s in skipped]
-    manifest = write_manifest(ep, weight_entries, graph_data, warnings, out_dir)
-    write_debug_report(ep, graph_data, weight_entries, manifest, out_dir)
+    package: Package = kuma_compile(ep)
+    package.write_dir(out_dir)
+    iph_path = package.save(out_dir / "model.iph")
 
     return {
         "ep": ep,
-        "graph_data": graph_data,
-        "blob": blob,
-        "weight_entries": weight_entries,
-        "skipped": skipped,
-        "manifest": manifest,
+        "package": package,
+        "graph_data": package.graph_data,
+        "blob": package.weights_blob,
+        "weight_entries": package.manifest["weights"],
+        "skipped": package.skipped,
+        "manifest": package.manifest,
         "out_dir": out_dir,
+        "iph_path": iph_path,
     }
 
 
@@ -72,7 +70,7 @@ def assert_weight_sizes_match(weight_entries: list[dict], blob: bytes) -> None:
 def assert_manifest_schema(manifest: dict) -> None:
     for key in ("format", "format_version", "inputs", "outputs", "weights", "graph", "warnings"):
         assert key in manifest, f"manifest.json missing key: {key!r}"
-    assert manifest["format"] == "iphso-webgpu-export"
+    assert manifest["format"] == "kuma"
     assert manifest["format_version"] == 0
     assert isinstance(manifest["weights"], list)
     assert "nodes" in manifest["graph"]

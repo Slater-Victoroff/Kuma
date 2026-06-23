@@ -3,23 +3,23 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "iphso-webgpu-export"
+name = "kuma"
 version = "0.1.0"
-description = "PyTorch → WebGPU graph capture and weight packing (Step 1)"
+description = "PyTorch torch.export -> .iph compiler/exporter (Step 1 of a Torch->WebGPU compiler)"
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.1",
     "numpy>=1.24",
 ]
 
-[project.scripts]
-iphso-webgpu-export = "iphso_webgpu_export.cli:main"
-
 [project.optional-dependencies]
 dev = ["pytest>=7.4"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+kuma = ["kernels/*.wgsl"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
