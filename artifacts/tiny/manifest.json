@@ -1,0 +1,329 @@
+{
+  "endianness": "little",
+  "format": "iphso-webgpu-export",
+  "format_version": 0,
+  "graph": {
+    "node_count": 10,
+    "nodes": [
+      {
+        "args": [],
+        "id": 0,
+        "kind": "parameter",
+        "kwargs": {},
+        "meta": {
+          "dtype": "float32",
+          "shape": [
+            16,
+            3,
+            3,
+            3
+          ]
+        },
+        "name": "arg0_1",
+        "op": "placeholder",
+        "target": "arg0_1",
+        "weight_name": "conv1.weight"
+      },
+      {
+        "args": [],
+        "id": 1,
+        "kind": "parameter",
+        "kwargs": {},
+        "meta": {
+          "dtype": "float32",
+          "shape": [
+            16
+          ]
+        },
+        "name": "arg1_1",
+        "op": "placeholder",
+        "target": "arg1_1",
+        "weight_name": "conv1.bias"
+      },
+      {
+        "args": [],
+        "id": 2,
+        "kind": "parameter",
+        "kwargs": {},
+        "meta": {
+          "dtype": "float32",
+          "shape": [
+            3,
+            16,
+            3,
+            3
+          ]
+        },
+        "name": "arg2_1",
+        "op": "placeholder",
+        "target": "arg2_1",
+        "weight_name": "conv2.weight"
+      },
+      {
+        "args": [],
+        "id": 3,
+        "kind": "parameter",
+        "kwargs": {},
+        "meta": {
+          "dtype": "float32",
+          "shape": [
+            3
+          ]
+        },
+        "name": "arg3_1",
+        "op": "placeholder",
+        "target": "arg3_1",
+        "weight_name": "conv2.bias"
+      },
+      {
+        "args": [],
+        "id": 4,
+        "kind": "user_input",
+        "kwargs": {},
+        "meta": {
+          "dtype": "float32",
+          "shape": [
+            1,
+            3,
+            32,
+            32
+          ]
+        },
+        "name": "arg4_1",
+        "op": "placeholder",
+        "target": "arg4_1"
+      },
+      {
+        "args": [
+          {
+            "node_ref": "arg4_1"
+          },
+          {
+            "node_ref": "arg0_1"
+          },
+          {
+            "node_ref": "arg1_1"
+          },
+          [
+            1,
+            1
+          ],
+          [
+            1,
+            1
+          ],
+          [
+            1,
+            1
+          ],
+          false,
+          [
+            0,
+            0
+          ],
+          1
+        ],
+        "id": 5,
+        "kwargs": {},
+        "meta": {
+          "dtype": "float32",
+          "shape": [
+            1,
+            16,
+            32,
+            32
+          ]
+        },
+        "name": "convolution",
+        "op": "call_function",
+        "target": "aten.convolution.default"
+      },
+      {
+        "args": [
+          {
+            "node_ref": "convolution"
+          }
+        ],
+        "id": 6,
+        "kwargs": {},
+        "meta": {
+          "dtype": "float32",
+          "shape": [
+            1,
+            16,
+            32,
+            32
+          ]
+        },
+        "name": "gelu",
+        "op": "call_function",
+        "target": "aten.gelu.default"
+      },
+      {
+        "args": [
+          {
+            "node_ref": "gelu"
+          },
+          {
+            "node_ref": "arg2_1"
+          },
+          {
+            "node_ref": "arg3_1"
+          },
+          [
+            1,
+            1
+          ],
+          [
+            1,
+            1
+          ],
+          [
+            1,
+            1
+          ],
+          false,
+          [
+            0,
+            0
+          ],
+          1
+        ],
+        "id": 7,
+        "kwargs": {},
+        "meta": {
+          "dtype": "float32",
+          "shape": [
+            1,
+            3,
+            32,
+            32
+          ]
+        },
+        "name": "convolution_1",
+        "op": "call_function",
+        "target": "aten.convolution.default"
+      },
+      {
+        "args": [
+          {
+            "node_ref": "convolution_1"
+          },
+          {
+            "node_ref": "arg4_1"
+          }
+        ],
+        "id": 8,
+        "kwargs": {},
+        "meta": {
+          "dtype": "float32",
+          "shape": [
+            1,
+            3,
+            32,
+            32
+          ]
+        },
+        "name": "add",
+        "op": "call_function",
+        "target": "aten.add.Tensor"
+      },
+      {
+        "args": [
+          [
+            {
+              "node_ref": "add"
+            }
+          ]
+        ],
+        "id": 9,
+        "kwargs": {},
+        "meta": {},
+        "name": "output",
+        "op": "output",
+        "target": "output"
+      }
+    ],
+    "op_counts": {
+      "aten.add.Tensor": 1,
+      "aten.convolution.default": 2,
+      "aten.gelu.default": 1
+    }
+  },
+  "inputs": [
+    {
+      "dtype": "float32",
+      "kind": "user_input",
+      "name": "arg4_1",
+      "shape": [
+        1,
+        3,
+        32,
+        32
+      ]
+    }
+  ],
+  "outputs": [
+    {
+      "dtype": "float32",
+      "name": "add",
+      "shape": [
+        1,
+        3,
+        32,
+        32
+      ]
+    }
+  ],
+  "unsupported_ops": [],
+  "warnings": [],
+  "weight_file": "weights.f32.bin",
+  "weights": [
+    {
+      "byte_length": 64,
+      "byte_offset": 0,
+      "dtype": "float32",
+      "n_elements": 16,
+      "name": "conv1.bias",
+      "shape": [
+        16
+      ]
+    },
+    {
+      "byte_length": 1728,
+      "byte_offset": 64,
+      "dtype": "float32",
+      "n_elements": 432,
+      "name": "conv1.weight",
+      "shape": [
+        16,
+        3,
+        3,
+        3
+      ]
+    },
+    {
+      "byte_length": 12,
+      "byte_offset": 1792,
+      "dtype": "float32",
+      "n_elements": 3,
+      "name": "conv2.bias",
+      "shape": [
+        3
+      ]
+    },
+    {
+      "byte_length": 1728,
+      "byte_offset": 1804,
+      "dtype": "float32",
+      "n_elements": 432,
+      "name": "conv2.weight",
+      "shape": [
+        3,
+        16,
+        3,
+        3
+      ]
+    }
+  ]
+}

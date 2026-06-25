@@ -1,0 +1,243 @@
+{
+  "format_version": 0,
+  "nodes": [
+    {
+      "id": 0,
+      "name": "arg0_1",
+      "op": "placeholder",
+      "target": "arg0_1",
+      "args": [],
+      "kwargs": {},
+      "meta": {
+        "shape": [
+          16,
+          3,
+          3,
+          3
+        ],
+        "dtype": "float32"
+      },
+      "kind": "parameter",
+      "weight_name": "conv1.weight"
+    },
+    {
+      "id": 1,
+      "name": "arg1_1",
+      "op": "placeholder",
+      "target": "arg1_1",
+      "args": [],
+      "kwargs": {},
+      "meta": {
+        "shape": [
+          16
+        ],
+        "dtype": "float32"
+      },
+      "kind": "parameter",
+      "weight_name": "conv1.bias"
+    },
+    {
+      "id": 2,
+      "name": "arg2_1",
+      "op": "placeholder",
+      "target": "arg2_1",
+      "args": [],
+      "kwargs": {},
+      "meta": {
+        "shape": [
+          3,
+          16,
+          3,
+          3
+        ],
+        "dtype": "float32"
+      },
+      "kind": "parameter",
+      "weight_name": "conv2.weight"
+    },
+    {
+      "id": 3,
+      "name": "arg3_1",
+      "op": "placeholder",
+      "target": "arg3_1",
+      "args": [],
+      "kwargs": {},
+      "meta": {
+        "shape": [
+          3
+        ],
+        "dtype": "float32"
+      },
+      "kind": "parameter",
+      "weight_name": "conv2.bias"
+    },
+    {
+      "id": 4,
+      "name": "arg4_1",
+      "op": "placeholder",
+      "target": "arg4_1",
+      "args": [],
+      "kwargs": {},
+      "meta": {
+        "shape": [
+          1,
+          3,
+          32,
+          32
+        ],
+        "dtype": "float32"
+      },
+      "kind": "user_input"
+    },
+    {
+      "id": 5,
+      "name": "convolution",
+      "op": "call_function",
+      "target": "aten.convolution.default",
+      "args": [
+        {
+          "node_ref": "arg4_1"
+        },
+        {
+          "node_ref": "arg0_1"
+        },
+        {
+          "node_ref": "arg1_1"
+        },
+        [
+          1,
+          1
+        ],
+        [
+          1,
+          1
+        ],
+        [
+          1,
+          1
+        ],
+        false,
+        [
+          0,
+          0
+        ],
+        1
+      ],
+      "kwargs": {},
+      "meta": {
+        "shape": [
+          1,
+          16,
+          32,
+          32
+        ],
+        "dtype": "float32"
+      }
+    },
+    {
+      "id": 6,
+      "name": "gelu",
+      "op": "call_function",
+      "target": "aten.gelu.default",
+      "args": [
+        {
+          "node_ref": "convolution"
+        }
+      ],
+      "kwargs": {},
+      "meta": {
+        "shape": [
+          1,
+          16,
+          32,
+          32
+        ],
+        "dtype": "float32"
+      }
+    },
+    {
+      "id": 7,
+      "name": "convolution_1",
+      "op": "call_function",
+      "target": "aten.convolution.default",
+      "args": [
+        {
+          "node_ref": "gelu"
+        },
+        {
+          "node_ref": "arg2_1"
+        },
+        {
+          "node_ref": "arg3_1"
+        },
+        [
+          1,
+          1
+        ],
+        [
+          1,
+          1
+        ],
+        [
+          1,
+          1
+        ],
+        false,
+        [
+          0,
+          0
+        ],
+        1
+      ],
+      "kwargs": {},
+      "meta": {
+        "shape": [
+          1,
+          3,
+          32,
+          32
+        ],
+        "dtype": "float32"
+      }
+    },
+    {
+      "id": 8,
+      "name": "add",
+      "op": "call_function",
+      "target": "aten.add.Tensor",
+      "args": [
+        {
+          "node_ref": "convolution_1"
+        },
+        {
+          "node_ref": "arg4_1"
+        }
+      ],
+      "kwargs": {},
+      "meta": {
+        "shape": [
+          1,
+          3,
+          32,
+          32
+        ],
+        "dtype": "float32"
+      }
+    },
+    {
+      "id": 9,
+      "name": "output",
+      "op": "output",
+      "target": "output",
+      "args": [
+        [
+          {
+            "node_ref": "add"
+          }
+        ]
+      ],
+      "kwargs": {},
+      "meta": {}
+    }
+  ]
+}
