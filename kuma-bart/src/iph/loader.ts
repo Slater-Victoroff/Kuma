@@ -1,5 +1,6 @@
 import { unzipSync } from "fflate";
 import type { KumaManifest } from "../types/manifest.js";
+import type { GoldenData } from "../types/golden.js";
 import { KumaManifestError } from "../errors.js";
 
 export interface IphPackage {
@@ -10,6 +11,9 @@ export interface IphPackage {
   /** snippet filename (e.g. "route_by_time.js") -> JS source, read from the package
    * itself — see engine/snippets.ts for how these get executed. */
   snippets: Map<string, string>;
+  /** Present only when the exporter had example inputs to capture it with — see
+   * types/golden.ts. */
+  golden?: GoldenData;
 }
 
 async function toBytes(source: ArrayBuffer | Response | string): Promise<Uint8Array> {
@@ -68,5 +72,8 @@ export async function loadIphPackage(source: ArrayBuffer | Response | string): P
     }
   }
 
-  return { manifest, weights, kernels, snippets };
+  const goldenBytes = files["golden.json"];
+  const golden = goldenBytes ? (JSON.parse(decoder.decode(goldenBytes)) as GoldenData) : undefined;
+
+  return { manifest, weights, kernels, snippets, golden };
 }

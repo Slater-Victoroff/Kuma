@@ -10,6 +10,8 @@ import { numElements } from "../engine/shape.js";
  * Doesn't call ctx.setOutput — callers that chain several of these per node (einsum)
  * only want the *last* result registered, and the caller's own node.meta.shape is the
  * authoritative (possibly >2D) shape to relabel the result with anyway. */
+const LINEAR_TILE = 16;
+
 export function dispatchLinear(ctx: OpContext, x: ResolvedTensor, weight: ResolvedTensor, bias: ResolvedTensor): ResolvedTensor {
   const k = x.shape[x.shape.length - 1]!;
   const m = numElements(x.shape) / k;
@@ -17,7 +19,11 @@ export function dispatchLinear(ctx: OpContext, x: ResolvedTensor, weight: Resolv
   const outShape = [m, n];
   const out = ctx.createBuffer(outShape);
   const params = ctx.uniform([m, k, n]);
-  ctx.dispatchKernel("linear.wgsl", [x.buffer, weight.buffer, bias.buffer, out, params], m * n);
+  // linear.wgsl is a 16x16-tiled matmul -- one workgroup per output tile, read directly
+  // via workgroup_id, not folded into a linear dispatchElements count (see its header).
+  const gridX = Math.ceil(n / LINEAR_TILE);
+  const gridY = Math.ceil(m / LINEAR_TILE);
+  ctx.dispatchKernelGrid("linear.wgsl", [x.buffer, weight.buffer, bias.buffer, out, params], gridX, gridY);
   return { buffer: out, shape: outShape };
 }
 

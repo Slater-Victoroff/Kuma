@@ -3,6 +3,120 @@ import type { ArgValue } from "../types/manifest.js";
 import { KumaShapeError, KumaUnsupportedOpError } from "../errors.js";
 import { numElements } from "../engine/shape.js";
 
+// Confirms which conv2d kernel each node actually routes to (verify() passing doesn't
+// prove this -- the general kernel is also correct, so it would pass either way
+// whether or not routing is working). Routing is confirmed correct as of this session
+// (depthwise/pointwise/general all firing as expected) -- this stays off by default
+// since console.log() at up to 13 calls/frame * 60fps has real, unpredictable cost
+// (worse with devtools open) and was directly responsible for an apparently "random"
+// main-thread stall during Play that turned out to just be this. Flip on for any new
+// "is routing actually doing what I think" check, but turn back off afterward.
+const CONV2D_DEBUG_ROUTING = false;
+
+const DEPTHWISE_TILE = 16;
+// Must match conv2d_depthwise.wgsl's PATCH_CAPACITY exactly -- the largest
+// (TILE-1)*stride+k halo patch (in floats) its shared-memory buffer can hold
+// (WebGPU's guaranteed-minimum maxComputeWorkgroupStorageSize, 16KB / 4 bytes).
+const DEPTHWISE_PATCH_CAPACITY = 4096;
+
+/** in_channels_per_group === 1 (every output channel depends on exactly one input
+ * channel, no cross-channel reduction) routes to the halo-tiled depthwise kernel
+ * instead of the general one, *if* its halo patch fits in shared memory -- an unusually
+ * large stride/kernel combination falls back to the general kernel below rather than
+ * guessing or failing. See conv2d_depthwise.wgsl's header for why this kernel exists
+ * (the general kernel's per-output-pixel reads have no cross-channel redundancy to
+ * exploit here, only spatial overlap between neighboring receptive fields, which this
+ * kernel's input-patch caching targets directly). Returns false (dispatched nothing)
+ * when the patch doesn't fit, so the caller falls through to the general path. */
+function tryDispatchConv2dDepthwise(
+  ctx: OpContext,
+  input: ResolvedTensor,
+  weight: ResolvedTensor,
+  bias: ResolvedTensor,
+  outShape: number[],
+  batch: number,
+  inChannels: number,
+  inH: number,
+  inW: number,
+  outChannels: number,
+  outH: number,
+  outW: number,
+  kh: number,
+  kw: number,
+  strideH: number,
+  strideW: number,
+  padH: number,
+  padW: number,
+  groups: number,
+): boolean {
+  const patchH = (DEPTHWISE_TILE - 1) * strideH + kh;
+  const patchW = (DEPTHWISE_TILE - 1) * strideW + kw;
+  if (patchH * patchW > DEPTHWISE_PATCH_CAPACITY) {
+    return false;
+  }
+
+  const out = ctx.createBuffer(outShape);
+  const params = ctx.uniform([batch, inChannels, inH, inW, outChannels, outH, outW, kh, kw, strideH, strideW, padH, padW, groups]);
+  const gridX = Math.ceil(outW / DEPTHWISE_TILE);
+  const gridY = Math.ceil(outH / DEPTHWISE_TILE);
+  const gridZ = batch * outChannels;
+  ctx.dispatchKernelGrid("conv2d_depthwise.wgsl", [input.buffer, weight.buffer, bias.buffer, out, params], gridX, gridY, gridZ);
+  ctx.setOutput(out, outShape);
+  return true;
+}
+
+// Must match conv2d_pointwise.wgsl's MAX_OUT_CHANNELS exactly -- the largest
+// out_channels its per-thread accumulator array can hold without risking register
+// spilling (a too-large per-thread array would be exactly the kind of "added overhead,
+// no offsetting benefit" mistake the weight-cache attempt made).
+const POINTWISE_MAX_OUT_CHANNELS = 64;
+
+/** kh===kw===1 && groups===1 (plain pointwise/channel-mixing conv, the overwhelmingly
+ * common case -- grouped pointwise falls back to the general kernel below rather than
+ * adding untested complexity for an unverified case) routes to the channel-mixing
+ * kernel, *if* out_channels fits its accumulator cap. See conv2d_pointwise.wgsl's
+ * header for why this kernel exists (the general kernel's per-output-element dispatch
+ * re-reads the same input pixel's channel vector once per output channel; this fixes
+ * that via loop reordering + a per-thread accumulator, no shared memory needed since
+ * pointwise convs have no spatial overlap between neighboring pixels to cache).
+ * Returns false (dispatched nothing) when out_channels doesn't fit, so the caller falls
+ * through to the general path. */
+function tryDispatchConv2dPointwise(
+  ctx: OpContext,
+  input: ResolvedTensor,
+  weight: ResolvedTensor,
+  bias: ResolvedTensor,
+  outShape: number[],
+  batch: number,
+  inChannels: number,
+  inH: number,
+  inW: number,
+  outChannels: number,
+  outH: number,
+  outW: number,
+  kh: number,
+  kw: number,
+  strideH: number,
+  strideW: number,
+  padH: number,
+  padW: number,
+  groups: number,
+): boolean {
+  if (kh !== 1 || kw !== 1 || groups !== 1 || outChannels > POINTWISE_MAX_OUT_CHANNELS) {
+    return false;
+  }
+
+  const out = ctx.createBuffer(outShape);
+  const params = ctx.uniform([batch, inChannels, inH, inW, outChannels, outH, outW, strideH, strideW, padH, padW]);
+  ctx.dispatchKernel(
+    "conv2d_pointwise.wgsl",
+    [input.buffer, weight.buffer, bias.buffer, out, params],
+    batch * outH * outW,
+  );
+  ctx.setOutput(out, outShape);
+  return true;
+}
+
 function dispatchConv2d(
   ctx: OpContext,
   input: ResolvedTensor,
@@ -32,28 +146,79 @@ function dispatchConv2d(
   const inW = input.shape[3]!;
   const kh = weight.shape[2]!;
   const kw = weight.shape[3]!;
-  const [strideH, strideW] = strideArg;
-  const [padH, padW] = paddingArg;
+  const strideH = strideArg[0]!;
+  const strideW = strideArg[1]!;
+  const padH = paddingArg[0]!;
+  const padW = paddingArg[1]!;
 
   const bias = biasRef === null ? { buffer: ctx.zeros(outChannels * 4), shape: [outChannels] } : ctx.resolve(biasRef);
 
+  const inChannelsPerGroup = inChannels / groups;
+  if (
+    inChannelsPerGroup === 1 &&
+    tryDispatchConv2dDepthwise(
+      ctx,
+      input,
+      weight,
+      bias,
+      outShape,
+      batch,
+      inChannels,
+      inH,
+      inW,
+      outChannels,
+      outH,
+      outW,
+      kh,
+      kw,
+      strideH,
+      strideW,
+      padH,
+      padW,
+      groups,
+    )
+  ) {
+    if (CONV2D_DEBUG_ROUTING) {
+      console.log(`[kuma] conv2d "${node.name}" -> conv2d_depthwise.wgsl (in_ch/grp=1, kh=${kh}, kw=${kw}, stride=${strideH}x${strideW})`);
+    }
+    return;
+  }
+  if (
+    tryDispatchConv2dPointwise(
+      ctx,
+      input,
+      weight,
+      bias,
+      outShape,
+      batch,
+      inChannels,
+      inH,
+      inW,
+      outChannels,
+      outH,
+      outW,
+      kh,
+      kw,
+      strideH,
+      strideW,
+      padH,
+      padW,
+      groups,
+    )
+  ) {
+    if (CONV2D_DEBUG_ROUTING) {
+      console.log(`[kuma] conv2d "${node.name}" -> conv2d_pointwise.wgsl (in_ch=${inChannels}, out_ch=${outChannels})`);
+    }
+    return;
+  }
+
+  if (CONV2D_DEBUG_ROUTING) {
+    console.log(
+      `[kuma] conv2d "${node.name}" -> conv2d.wgsl (general fallback; in_ch/grp=${inChannelsPerGroup}, kh=${kh}, kw=${kw}, out_ch=${outChannels}, groups=${groups})`,
+    );
+  }
   const out = ctx.createBuffer(outShape);
-  const params = ctx.uniform([
-    batch,
-    inChannels,
-    inH,
-    inW,
-    outChannels,
-    outH,
-    outW,
-    kh,
-    kw,
-    strideH!,
-    strideW!,
-    padH!,
-    padW!,
-    groups,
-  ]);
+  const params = ctx.uniform([batch, inChannels, inH, inW, outChannels, outH, outW, kh, kw, strideH, strideW, padH, padW, groups]);
   ctx.dispatchKernel("conv2d.wgsl", [input.buffer, weight.buffer, bias.buffer, out, params], numElements(outShape));
   ctx.setOutput(out, outShape);
 }

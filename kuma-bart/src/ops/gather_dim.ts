@@ -42,5 +42,15 @@ export function gatherDimHandler(ctx: OpContext): void {
   const out = ctx.createBuffer(outShape);
   const params = ctx.uniform([...paddedOutShape, ...paddedInStrides, gatherStride, n]);
   ctx.dispatchKernel("gather_dim.wgsl", [input.buffer, index.buffer, out, params], n);
-  ctx.setOutput(out, outShape);
+
+  // Same complex-pairing gap as ops/gather.ts -- a strided gather doesn't care whether
+  // the values it's moving are the real or imaginary half, so the imaginary buffer (if
+  // any) needs the identical gather dispatched against it too.
+  let outImag: GPUBuffer | undefined;
+  if (input.imag) {
+    outImag = ctx.createBuffer(outShape);
+    ctx.dispatchKernel("gather_dim.wgsl", [input.imag, index.buffer, outImag, params], n);
+  }
+
+  ctx.setOutput(out, outShape, outImag);
 }

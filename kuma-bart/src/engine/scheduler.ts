@@ -1,5 +1,12 @@
 import { isNodeRef, type ArgValue, type GraphNode, type KumaManifest, type NodeRef } from "../types/manifest.js";
-import { OpContext, type ResolvedTensor } from "./context.js";
+import {
+  OpContext,
+  type ResolvedTensor,
+  type BufferPoolState,
+  createBufferPoolState,
+  acquireGenerationSlot,
+  releaseGenerationSlot,
+} from "./context.js";
 import { numElements } from "./shape.js";
 import { opRegistry, findLinearWeightElisions } from "../ops/index.js";
 import { KumaManifestError, KumaUnsupportedOpError } from "../errors.js";
@@ -20,15 +27,50 @@ export interface RunGraphParams {
   rawInputs?: ReadonlyMap<string, Float32Array>;
   snippets?: ReadonlyMap<string, string>;
   snippetCache?: Map<string, SnippetFn>;
+  /** Shared with OpContext.getOrUploadConstant — persists shape-derived constants (e.g.
+   * DFT basis matrices) across nodes and across calls to runGraph, not just within one.
+   * Defaults to a fresh (i.e. cold) Map when omitted. */
+  constantCache?: Map<string, GPUBuffer>;
+  /** Node names to read back and return *in addition to* the manifest's own declared
+   * outputs (appended to the same returned array, found by name) -- e.g. the
+   * golden-value verifier (engine/verify.ts) wants every node golden.json has an entry
+   * for, not just whatever the model itself outputs. Every captured buffer is read back
+   * in the same single batch as the real outputs -- no per-node slowdown. Names not
+   * present in `resolved` (e.g. a typo, or a node the graph didn't actually reach) are
+   * silently omitted from the result rather than failing the whole run. */
+  captureNodes?: ReadonlySet<string>;
+  /** Skip the GPU->CPU readback for the manifest's own declared outputs -- `data` comes
+   * back as an empty Float32Array(0) for them (still real and correctly-ordered: just
+   * unread). Measured readback (mapAsync'ing a multi-megabyte buffer back into JS) at
+   * 60-70ms for an 11MB frame, dwarfing both the GPU compute itself (~32ms) and the
+   * CPU-side cost of encoding every dispatch (~2ms) -- this is mapAsync/IPC overhead in
+   * the browser's WebGPU implementation, paid for data that then goes unused. A caller that
+   * only wants `buffer` (e.g. to render directly via a GPU render pass, which the GPU
+   * itself correctly orders after this submission with no CPU wait needed) should set
+   * this. `captureNodes` are unaffected -- those are always read back, since the only
+   * current caller of that (the verifier) always needs the data. */
+  skipOutputReadback?: boolean;
+  /** Shared with OpContext.createBuffer -- persists pooled output buffers across calls,
+   * same lifecycle as constantCache. Defaults to a fresh (i.e. cold, unpooled-benefit)
+   * state when omitted -- see createBufferPoolState. */
+  bufferPool?: BufferPoolState;
 }
 
 export interface RunGraphOutput {
   name: string;
   shape: number[];
   data: Float32Array;
+  /** The GPU buffer `data` was read back from -- still valid (not destroyed/reused;
+   * this codebase doesn't pool buffers) after runGraph returns, so a caller that wants
+   * to render or otherwise consume the result entirely on-GPU (e.g. the demo's canvas)
+   * doesn't have to round-trip through `data` just to get a buffer reference back. */
+  buffer: GPUBuffer;
+  /** Set only for a captured node that happened to be complex-paired -- the manifest's
+   * own declared outputs are always real in every model exported so far. */
+  imag?: Float32Array;
 }
 
-interface SwitchResolution {
+export interface SwitchResolution {
   /** The flattened, GPU-loop-ready node list: js_snippet nodes and JS-routed getitem
    * nodes removed entirely (nothing for the GPU to do), switch nodes replaced by
    * their one chosen branch's nodes plus a synthetic alias so later refs to the
@@ -46,8 +88,11 @@ interface SwitchResolution {
  * branch's nodes into the effective execution list. Runs entirely before any GPU
  * command encoder exists. See kuma-bart's plan notes for why this is scoped to
  * input-only snippet dependencies (sidesteps mid-graph GPU readback entirely).
+ *
+ * Exported so engine/profile.ts can run the exact same branch-selection logic
+ * runGraph does, without duplicating it.
  */
-function resolveSwitches(
+export function resolveSwitches(
   device: GPUDevice,
   nodes: readonly GraphNode[],
   rawInputs: ReadonlyMap<string, Float32Array>,
@@ -157,6 +202,24 @@ function resolveSwitches(
   return { nodes: flat, seeded };
 }
 
+// CPU-side wall-clock breakdown of the phases engine/profile.ts's GPU timestamp queries
+// can never see, since all of them happen entirely outside any compute pass: ENCODING
+// (building a buffer + uniform buffer + bind group for every dispatch -- measured at
+// ~2ms even for 276 nodes, not the bottleneck it looked like it might be), READBACK
+// (the final GPU->CPU copy + mapAsync wait -- this WAS the bottleneck, at 60-70ms for
+// an 11MB frame, which is why skipOutputReadback/runToGpu exists), and CLEANUP (the
+// per-node buffer.destroy() pass -- ruled out as the "real frame time vs.
+// GPU-timestamped breakdown" gap's cause, at <1ms; that gap turned out to be a fixed
+// ~30ms GPU-completion-notification latency in this browser's implementation,
+// independent of work/data size -- confirmed by the GPU-side shared-pass timestamp
+// below matching the breakdown almost exactly while CPU-side waits for that same work
+// to be reported done took ~30ms regardless. Demo's runAt now pipelines multiple
+// frames in flight to amortize that latency instead of paying it every frame -- see
+// demo/main.ts's MAX_IN_FLIGHT). Flip on for any new "why is this slow" dive; off by
+// default since the per-frame debug GPU timestamp readback below pays that same ~30ms
+// itself every call, which would defeat the in-flight pipelining if left on.
+const DEBUG_TIMING = false;
+
 /** Walks `manifest.graph.nodes` in order (already topologically sorted by the Python
  * exporter), resolving each node to a GPUBuffer and dispatching its op, then reads back
  * the tensors the `output` node points at. */
@@ -165,13 +228,30 @@ export async function runGraph(params: RunGraphParams): Promise<RunGraphOutput[]
   const rawInputs = params.rawInputs ?? new Map<string, Float32Array>();
   const snippets = params.snippets ?? new Map<string, string>();
   const snippetCache = params.snippetCache ?? new Map<string, SnippetFn>();
+  const constantCache = params.constantCache ?? new Map<string, GPUBuffer>();
+  const bufferPool = params.bufferPool ?? createBufferPoolState();
+  const t0 = DEBUG_TIMING ? performance.now() : 0;
+
+  // Must happen before any pooled buffer (via OpContext.createBuffer below) gets
+  // reused for this call -- see acquireGenerationSlot's own docs for what this does
+  // and doesn't wait for.
+  await acquireGenerationSlot(device, bufferPool);
 
   const { nodes, seeded } = resolveSwitches(device, manifest.graph.nodes, rawInputs, snippets, snippetCache);
   const elisions = findLinearWeightElisions(nodes);
   const resolved = new Map<string, ResolvedTensor>(seeded);
 
+  // Diagnostic: a GPU-side timestamp pair around the *whole* shared pass, to settle
+  // directly (no CPU-side ambiguity) whether the shared pass's own GPU execution time
+  // actually matches profile.ts's per-node-summed breakdown or runs much longer --
+  // gated on DEBUG_TIMING since it's part of the same investigation.
+  const debugGpuTiming = DEBUG_TIMING && device.features.has("timestamp-query");
+  const debugQuerySet = debugGpuTiming ? device.createQuerySet({ type: "timestamp", count: 2 }) : undefined;
+
   const encoder = device.createCommandEncoder();
-  const pass = encoder.beginComputePass();
+  const pass = encoder.beginComputePass(
+    debugQuerySet ? { timestampWrites: { querySet: debugQuerySet, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1 } } : undefined,
+  );
 
   let outputNode: GraphNode | undefined;
 
@@ -217,8 +297,10 @@ export async function runGraph(params: RunGraphParams): Promise<RunGraphOutput[]
     if (!handler) {
       throw new KumaUnsupportedOpError(node.target, node.name);
     }
-    const ctx = new OpContext(device, kernels, pipelineCache, pass, resolved, node);
+
+    const ctx = new OpContext(device, kernels, pipelineCache, pass, resolved, node, constantCache, bufferPool);
     handler(ctx);
+
     // Multi-output nodes (e.g. aten.chunk.default) register per-index results via
     // setIndexedOutput instead of a single setOutput — nothing to check here for them.
     const isMultiOutput = node.meta.outputs !== undefined;
@@ -230,26 +312,126 @@ export async function runGraph(params: RunGraphParams): Promise<RunGraphOutput[]
   }
 
   pass.end();
+  let debugQueryBuffer: GPUBuffer | undefined;
+  if (debugQuerySet) {
+    debugQueryBuffer = device.createBuffer({ size: 16, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC });
+    encoder.resolveQuerySet(debugQuerySet, 0, 2, debugQueryBuffer, 0);
+  }
   device.queue.submit([encoder.finish()]);
+  releaseGenerationSlot(device, bufferPool);
+  const t1 = DEBUG_TIMING ? performance.now() : 0;
+
+  if (debugQuerySet && debugQueryBuffer) {
+    const staging = device.createBuffer({ size: 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const copyEncoder = device.createCommandEncoder();
+    copyEncoder.copyBufferToBuffer(debugQueryBuffer, 0, staging, 0, 16);
+    device.queue.submit([copyEncoder.finish()]);
+    await staging.mapAsync(GPUMapMode.READ);
+    const timestamps = new BigUint64Array(staging.getMappedRange(0, 16).slice(0));
+    staging.unmap();
+    staging.destroy();
+    debugQuerySet.destroy();
+    debugQueryBuffer.destroy();
+    const gpuMicroseconds = Number(timestamps[1]! - timestamps[0]!) / 1000;
+    console.log(`[kuma] runGraph GPU-only shared-pass time: ${(gpuMicroseconds / 1000).toFixed(2)}ms`);
+  }
 
   if (!outputNode) {
     throw new KumaManifestError('Manifest graph has no "output" node.');
   }
 
   const outputRefs = (outputNode.args[0] as NodeRef[] | undefined) ?? [];
-  const reads = outputRefs.map((ref) => {
+  const outputTensors = outputRefs.map((ref) => {
     const tensor = resolved.get(ref.node_ref);
     if (!tensor) {
       throw new KumaManifestError(`Output references "${ref.node_ref}" which was never computed.`);
     }
-    return { buffer: tensor.buffer, byteLength: numElements(tensor.shape) * 4, shape: tensor.shape };
+    return tensor;
   });
 
-  const datas = await readBuffers(device, reads);
+  const capturedNames: string[] = [];
+  const capturedTensors: ResolvedTensor[] = [];
+  for (const name of params.captureNodes ?? []) {
+    const tensor = resolved.get(name);
+    if (tensor) {
+      capturedNames.push(name);
+      capturedTensors.push(tensor);
+    }
+  }
 
-  return manifest.outputs.map((spec, i) => ({
-    name: spec.name,
-    shape: reads[i]!.shape,
-    data: datas[i]!,
-  }));
+  const tensorsToRead = params.skipOutputReadback ? capturedTensors : [...outputTensors, ...capturedTensors];
+  const reads = tensorsToRead.flatMap((tensor) => {
+    const byteLength = numElements(tensor.shape) * 4;
+    const entries = [{ buffer: tensor.buffer, byteLength }];
+    if (tensor.imag) entries.push({ buffer: tensor.imag, byteLength });
+    return entries;
+  });
+  const datas = reads.length > 0 ? await readBuffers(device, reads) : [];
+  const t2 = DEBUG_TIMING ? performance.now() : 0;
+
+  let cursor = 0;
+  const nextRead = (tensor: ResolvedTensor, skip: boolean): { data: Float32Array; imag?: Float32Array } => {
+    if (skip) return { data: new Float32Array(0) };
+    const data = datas[cursor++]!;
+    const imag = tensor.imag ? datas[cursor++]! : undefined;
+    return { data, imag };
+  };
+
+  const outputs: RunGraphOutput[] = manifest.outputs.map((spec, i) => {
+    const tensor = outputTensors[i]!;
+    const { data, imag } = nextRead(tensor, !!params.skipOutputReadback);
+    return { name: spec.name, shape: tensor.shape, data, buffer: tensor.buffer, imag };
+  });
+  for (let i = 0; i < capturedNames.length; i++) {
+    const tensor = capturedTensors[i]!;
+    const { data, imag } = nextRead(tensor, false);
+    outputs.push({ name: capturedNames[i]!, shape: tensor.shape, data, buffer: tensor.buffer, imag });
+  }
+
+  // call_function node outputs now come from OpContext.createBuffer's pool (see
+  // BUFFER_POOL_DEPTH) rather than a fresh allocation every call, *except* for
+  // anything a node builds beyond what its pool covers (shouldn't normally happen,
+  // since every createBuffer call goes through the pool) and anything never routed
+  // through createBuffer at all (input/seeded buffers, uploaded fresh per call by the
+  // caller/resolveSwitches, not by op handlers). For those, `.destroy()` while GPU work
+  // referencing the buffer is still in flight is well-defined per spec -- the
+  // underlying memory isn't actually reclaimed until that work completes, so this
+  // remains safe even though nothing here awaited onSubmittedWorkDone(). This is also
+  // still what protects against the original OOM crash (VK_ERROR_OUT_OF_DEVICE_MEMORY,
+  // then a lost device) this session, for whatever doesn't go through the pool. Keep:
+  // weights (persist for the model's lifetime), every pooled buffer (persists by
+  // design -- destroying one here would be reusing it into oblivion, not freeing
+  // anything), and whatever's actually being handed back to the caller in `outputs`.
+  const keep = new Set<GPUBuffer>();
+  for (const t of weightBuffers.values()) {
+    keep.add(t.buffer);
+    if (t.imag) keep.add(t.imag);
+  }
+  for (const slots of bufferPool.pools.values()) {
+    for (const buffer of slots) {
+      keep.add(buffer);
+    }
+  }
+  for (const t of [...outputTensors, ...capturedTensors]) {
+    keep.add(t.buffer);
+    if (t.imag) keep.add(t.imag);
+  }
+  const destroyed = new Set<GPUBuffer>();
+  const destroyIfTemporary = (buffer: GPUBuffer): void => {
+    if (keep.has(buffer) || destroyed.has(buffer)) return;
+    destroyed.add(buffer);
+    buffer.destroy();
+  };
+  for (const tensor of resolved.values()) {
+    destroyIfTemporary(tensor.buffer);
+    if (tensor.imag) destroyIfTemporary(tensor.imag);
+  }
+  if (DEBUG_TIMING) {
+    const t3 = performance.now();
+    console.log(
+      `[kuma] runGraph timing: resolve+encode+submit=${(t1 - t0).toFixed(1)}ms readback=${(t2 - t1).toFixed(1)}ms cleanup=${(t3 - t2).toFixed(1)}ms total=${(t3 - t0).toFixed(1)}ms (${nodes.length} nodes, ${reads.length} buffer read(s), ${destroyed.size} buffer(s) destroyed${params.skipOutputReadback ? ", output readback skipped" : ""})`,
+    );
+  }
+
+  return outputs;
 }

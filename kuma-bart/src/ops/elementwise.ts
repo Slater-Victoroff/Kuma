@@ -2,15 +2,38 @@ import type { OpContext, OpHandler, ResolvedTensor } from "../engine/context.js"
 import type { ArgValue } from "../types/manifest.js";
 import { KumaShapeError, KumaUnsupportedOpError } from "../errors.js";
 import { numElements } from "../engine/shape.js";
+import { broadcastTensor } from "./expand.js";
+
+function sameShape(a: readonly number[], b: readonly number[]): boolean {
+  return a.length === b.length && a.every((d, i) => d === b[i]);
+}
 
 /** Most call sites pass two tensors, but torch.export sometimes records e.g.
  * `tensor * 32` as aten.mul.Tensor with a literal Python number as the second arg
- * (rather than the .Scalar overload) — broadcast that as a same-shape constant. */
+ * (rather than the .Scalar overload) — broadcast that as a same-shape constant.
+ *
+ * PyTorch's binary ops broadcast implicitly (ATen's own kernels handle it internally),
+ * so torch.export traces e.g. a [1,40]-vs-[35,40] aten.div.Tensor with no expand node
+ * in between — the smaller operand arrives here at its original, un-broadcast shape.
+ * This project's binary WGSL kernels are flat/broadcast-unaware, so an operand whose
+ * shape doesn't already match the op's output shape needs to be materialized up to it
+ * first (same machinery aten.expand.default uses) — skipping this previously meant the
+ * kernel read past the smaller buffer's end for every output index beyond its own
+ * length, landing on whatever this GPU's robust-buffer-access default returns for an
+ * out-of-bounds storage read (here: 0), turning a real-but-small divisor into 0 and the
+ * result into +-Infinity. */
 function resolveOperand(ctx: OpContext, arg: ArgValue, shape: readonly number[]): ResolvedTensor {
   if (typeof arg === "number") {
     return { buffer: ctx.uploadConstant(new Float32Array(numElements(shape)).fill(arg)), shape: [...shape] };
   }
-  return ctx.resolve(arg);
+  const tensor = ctx.resolve(arg);
+  if (sameShape(tensor.shape, shape)) {
+    return tensor;
+  }
+  const buffer = broadcastTensor(ctx, tensor, shape);
+  // imag (if present) needs the exact same broadcast, or it'd silently go missing.
+  const imag = tensor.imag ? broadcastTensor(ctx, { buffer: tensor.imag, shape: tensor.shape }, shape) : undefined;
+  return { buffer, shape: [...shape], imag };
 }
 
 function dispatchBinary(ctx: OpContext, kernelName: string, x: GPUBuffer, y: GPUBuffer, shape: readonly number[], n: number): GPUBuffer {

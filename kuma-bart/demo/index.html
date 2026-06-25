@@ -20,6 +20,25 @@
         padding: 0.4rem;
         width: 26rem;
       }
+      input[type="range"] {
+        width: 24rem;
+        vertical-align: middle;
+      }
+      .controls {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        margin: 0.5rem 0;
+      }
+      #tValue {
+        display: inline-block;
+        width: 4rem;
+      }
+      #frameStatus {
+        font-size: 0.9rem;
+        color: #555;
+        min-height: 1.2em;
+      }
       pre {
         background: #111;
         color: #0f0;
@@ -41,8 +60,17 @@
     <p>
       <label for="path">.iph path: </label>
       <input id="path" type="text" value="/artifacts/3mbunny.iph" />
+      <button id="load">Load</button>
+      <button id="verify" disabled>Verify against golden.json</button>
+      <button id="profile" disabled>Profile one frame</button>
     </p>
-    <button id="run">Load &amp; run</button>
+    <div class="controls">
+      <label for="t">t:</label>
+      <input id="t" type="range" min="0" max="1" step="0.001" value="0.5" disabled />
+      <span id="tValue">0.500</span>
+      <button id="play" disabled>Play</button>
+    </div>
+    <div id="frameStatus"></div>
     <pre id="log">(idle)</pre>
     <canvas id="frame"></canvas>
     <script type="module" src="./main.ts"></script>

@@ -26,7 +26,8 @@ function moveAxisBack(ctx: OpContext, tensor: ResolvedTensor, swapDims: number[]
 }
 
 function matmulBasis(ctx: OpContext, x: ResolvedTensor, basis: ResolvedTensor): ResolvedTensor {
-  const zeroBias = { buffer: ctx.zeros(basis.shape[0]! * 4), shape: [basis.shape[0]!] };
+  const n = basis.shape[0]!;
+  const zeroBias = { buffer: ctx.getOrCreateZeroBuffer(`zeroBias:${n}`, n * 4), shape: [n] };
   return dispatchLinear(ctx, x, basis, zeroBias);
 }
 
@@ -35,9 +36,14 @@ function matmulBasis(ctx: OpContext, x: ResolvedTensor, basis: ResolvedTensor): 
  * axis below, since that one collapses complex -> real). */
 function complexIfftAlongAxis(ctx: OpContext, real: ResolvedTensor, imag: ResolvedTensor, axis: number): { real: ResolvedTensor; imag: ResolvedTensor } {
   const n = real.shape[axis]!;
-  const { cos, sin } = complexIfftBasis(n);
-  const cosTensor: ResolvedTensor = { buffer: ctx.uploadConstant(cos), shape: [n, n] };
-  const sinTensor: ResolvedTensor = { buffer: ctx.uploadConstant(sin), shape: [n, n] };
+  // cos/sin only depend on the transform length n, never on the actual data -- computing
+  // an n*n trig basis and re-uploading it from scratch on every single inference call
+  // (every frame, for a model run interactively) was pure waste. Cached for the lifetime
+  // of the model now (see OpContext.getOrUploadConstant).
+  const cosBuffer = ctx.getOrUploadConstant(`complexIfft:cos:${n}`, () => complexIfftBasis(n).cos);
+  const sinBuffer = ctx.getOrUploadConstant(`complexIfft:sin:${n}`, () => complexIfftBasis(n).sin);
+  const cosTensor: ResolvedTensor = { buffer: cosBuffer, shape: [n, n] };
+  const sinTensor: ResolvedTensor = { buffer: sinBuffer, shape: [n, n] };
 
   const { result: realMoved, swapDims } = moveAxisToLast(ctx, real, axis);
   const { result: imagMoved } = moveAxisToLast(ctx, imag, axis);
@@ -69,9 +75,12 @@ function complexIfftAlongAxis(ctx: OpContext, real: ResolvedTensor, imag: Resolv
  * -> outputLength real values. Must run last (collapses complex -> real). */
 function realIfftLastAxis(ctx: OpContext, real: ResolvedTensor, imag: ResolvedTensor, outputLength: number): ResolvedTensor {
   const whalf = real.shape[real.shape.length - 1]!;
-  const { a, b } = irfftBasis(outputLength);
-  const aTensor: ResolvedTensor = { buffer: ctx.uploadConstant(a), shape: [outputLength, whalf] };
-  const bTensor: ResolvedTensor = { buffer: ctx.uploadConstant(b), shape: [outputLength, whalf] };
+  // Same reasoning as complexIfftAlongAxis's cos/sin -- a pure function of outputLength,
+  // cached rather than recomputed and re-uploaded every call.
+  const aBuffer = ctx.getOrUploadConstant(`irfft:a:${outputLength}`, () => irfftBasis(outputLength).a);
+  const bBuffer = ctx.getOrUploadConstant(`irfft:b:${outputLength}`, () => irfftBasis(outputLength).b);
+  const aTensor: ResolvedTensor = { buffer: aBuffer, shape: [outputLength, whalf] };
+  const bTensor: ResolvedTensor = { buffer: bBuffer, shape: [outputLength, whalf] };
 
   const m = real.shape.slice(0, -1).reduce((x, y) => x * y, 1);
   const real2d = { buffer: real.buffer, shape: [m, whalf] };

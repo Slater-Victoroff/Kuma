@@ -20,6 +20,11 @@ class Package:
     kernels: dict[str, bytes] = field(default_factory=dict)
     snippets: dict[str, bytes] = field(default_factory=dict)
     skipped: list[str] = field(default_factory=list)
+    # Optional companion to manifest.json: a handful of summary stats (shape/mean/min/
+    # max/sample values) per graph node, captured from a real eager PyTorch run -- lets
+    # a runtime (e.g. kuma-bart) verify it computes the same values, not just NaN-free
+    # ones. None when the caller didn't have example inputs to capture it with.
+    golden: dict[str, Any] | None = None
 
     def save(self, out: str | Path) -> Path:
         """Write the self-contained .iph package (a zip archive) to `out`."""
@@ -33,6 +38,8 @@ class Package:
             for name, source in self.snippets.items():
                 zf.writestr(f"snippets/{name}", source)
             zf.writestr("debug_report.md", self.debug_report)
+            if self.golden is not None:
+                zf.writestr("golden.json", json.dumps(self.golden))
         return out
 
     def write_dir(self, out_dir: str | Path) -> Path:
@@ -45,6 +52,8 @@ class Package:
         (out_dir / "weights.f32.bin").write_bytes(self.weights_blob)
         (out_dir / "exported_graph.json").write_text(json.dumps(self.graph_data, indent=2))
         (out_dir / "debug_report.md").write_text(self.debug_report)
+        if self.golden is not None:
+            (out_dir / "golden.json").write_text(json.dumps(self.golden, indent=2))
 
         kernels_dir = out_dir / "kernels"
         kernels_dir.mkdir(exist_ok=True)

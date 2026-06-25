@@ -16,6 +16,7 @@ from typing import Any
 
 import torch.export
 
+from kuma.golden import capture_golden, namespace_golden
 from kuma.graph import serialize_graph
 from kuma.kernels import load_kernels
 from kuma.pack_weights import pack_weights
@@ -101,6 +102,7 @@ def compile_branching(
     selector_output_index: int,
     branch_input_output_index: int,
     branch_eps: list[torch.export.ExportedProgram],
+    branch_example_inputs: list[tuple] | None = None,
 ) -> Any:
     """
     Assemble a branching Package.
@@ -115,6 +117,12 @@ def compile_branching(
                                  (the routed value, e.g. local_norm_t) input.
     branch_eps — one independently torch.export'd ExportedProgram per branch, e.g.
                  via `torch.export.export(wrapper_for_segment_i, (example_local_t,))`.
+    branch_example_inputs — optional, one example-input tuple per branch (same ones
+                             each branch_eps[i] was traced with) -- when given, captures
+                             golden.json (a real eager run's per-node value stats, for
+                             verifying a runtime against), namespaced the same way as
+                             each branch's own node names. Omit to skip golden capture
+                             entirely, same as before this existed.
     """
     from kuma.package_iph import Package  # local import: avoids a package_iph<->branching cycle
 
@@ -161,10 +169,14 @@ def compile_branching(
     warnings: list[str] = []
     running_offset = 0
     switch_output_shape: list[int] | None = None
+    golden_branches: list[dict[str, Any]] | None = [] if branch_example_inputs is not None else None
 
     for i, ep in enumerate(branch_eps):
         node_prefix = f"branch{i}__"
         weight_prefix = f"branch{i}."
+
+        if golden_branches is not None:
+            golden_branches.append(namespace_golden(capture_golden(ep, branch_example_inputs[i]), node_prefix))
 
         graph_data = serialize_graph(ep)
         branch_weights_blob, weight_entries, skipped = pack_weights(ep)
@@ -260,6 +272,8 @@ def compile_branching(
         + ("\n## Warnings\n" + "\n".join(f"- {w}" for w in warnings) + "\n" if warnings else "")
     )
 
+    golden = {"format_version": 0, "branches": golden_branches} if golden_branches is not None else None
+
     return Package(
         manifest=manifest,
         weights_blob=weights_blob,
@@ -267,4 +281,5 @@ def compile_branching(
         debug_report=debug_report,
         kernels=load_kernels(),
         snippets={router_snippet_name: router_snippet_source.encode("utf-8")},
+        golden=golden,
     )

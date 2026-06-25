@@ -38,5 +38,16 @@ export function gatherHandler(ctx: OpContext): void {
   const out = ctx.createBuffer(outShape);
   const params = ctx.uniform([outer, inner, inExtent, numIndices, n]);
   ctx.dispatchKernel("gather.wgsl", [input.buffer, indices.buffer, out, params], n);
-  ctx.setOutput(out, outShape);
+
+  // Gathering rows is purely a buffer-layout operation -- if the source is
+  // complex-paired, the imaginary half needs the exact same row gather, or it silently
+  // vanishes (verified against a real eager-PyTorch run: this was dropping the
+  // imaginary part of a complex gather entirely).
+  let outImag: GPUBuffer | undefined;
+  if (input.imag) {
+    outImag = ctx.createBuffer(outShape);
+    ctx.dispatchKernel("gather.wgsl", [input.imag, indices.buffer, outImag, params], n);
+  }
+
+  ctx.setOutput(out, outShape, outImag);
 }

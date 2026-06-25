@@ -9,5 +9,10 @@ export async function requestKumaDevice(): Promise<GPUDevice> {
   if (!adapter) {
     throw new Error("WebGPU adapter request failed — no compatible GPU adapter found.");
   }
-  return adapter.requestDevice();
+  // Opportunistic: only enables GPU-side profiling (engine/profile.ts) when the
+  // adapter actually supports it -- most desktop Chrome/Edge GPUs do, but this must be
+  // requested at device-creation time (features can't be added afterward), so it's
+  // requested here unconditionally rather than only when profiling is first used.
+  const requiredFeatures: GPUFeatureName[] = adapter.features.has("timestamp-query") ? ["timestamp-query"] : [];
+  return adapter.requestDevice({ requiredFeatures });
 }

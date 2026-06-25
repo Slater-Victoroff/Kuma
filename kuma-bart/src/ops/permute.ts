@@ -37,14 +37,33 @@ export function dispatchPermute(
   return { buffer: out, shape: [...outShape] };
 }
 
+/** Permutes a tensor's real part, and — if it's complex-paired — its imaginary part
+ * identically (same dims/shape; the two parts are always geometrically in lockstep).
+ * dispatchPermute itself only ever sees one plain GPUBuffer, by design (it's also used
+ * standalone, e.g. by ops/expand.ts, against a buffer that's never complex) — this is
+ * the complex-aware wrapper for callers (the handlers below, einsum's pairwise-
+ * contraction permutes) that need to permute a full ResolvedTensor and not lose the
+ * imaginary half in the process. */
+export function permuteMaybeComplex(
+  ctx: OpContext,
+  tensor: ResolvedTensor,
+  outShape: readonly number[],
+  dims: readonly number[],
+): ResolvedTensor {
+  const re = dispatchPermute(ctx, tensor.buffer, tensor.shape, outShape, dims);
+  if (!tensor.imag) return re;
+  const im = dispatchPermute(ctx, tensor.imag, tensor.shape, outShape, dims);
+  return { buffer: re.buffer, shape: re.shape, imag: im.buffer };
+}
+
 export function permuteHandler(ctx: OpContext): void {
   const [inputRef, dimsArg] = ctx.node.args as [ArgValue, number[]];
   const input = ctx.resolve(inputRef);
   const rank = input.shape.length;
   const dims = dimsArg.map((d) => (d < 0 ? d + rank : d));
   const outShape = dims.map((d) => input.shape[d]!);
-  const result = dispatchPermute(ctx, input.buffer, input.shape, outShape, dims);
-  ctx.setOutput(result.buffer, result.shape);
+  const result = permuteMaybeComplex(ctx, input, outShape, dims);
+  ctx.setOutput(result.buffer, result.shape, result.imag);
 }
 
 export function transposeHandler(ctx: OpContext): void {
@@ -60,6 +79,6 @@ export function transposeHandler(ctx: OpContext): void {
   dims[dim1] = tmp;
 
   const outShape = dims.map((d) => input.shape[d]!);
-  const result = dispatchPermute(ctx, input.buffer, input.shape, outShape, dims);
-  ctx.setOutput(result.buffer, result.shape);
+  const result = permuteMaybeComplex(ctx, input, outShape, dims);
+  ctx.setOutput(result.buffer, result.shape, result.imag);
 }

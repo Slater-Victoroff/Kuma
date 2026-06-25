@@ -65,15 +65,19 @@ export async function readBuffers(
   });
   device.queue.submit([encoder.finish()]);
 
-  const results: Float32Array[] = [];
-  for (let i = 0; i < reads.length; i++) {
-    const stagingBuffer = staging[i]!;
-    const byteLength = reads[i]!.byteLength;
-    await stagingBuffer.mapAsync(GPUMapMode.READ);
-    const copy = new Float32Array(stagingBuffer.getMappedRange(0, byteLength).slice(0));
-    stagingBuffer.unmap();
-    stagingBuffer.destroy();
-    results.push(copy);
-  }
-  return results;
+  // The copies are all already submitted together -- awaiting each mapAsync in sequence
+  // (as opposed to letting them resolve concurrently) doesn't change correctness, just
+  // adds up their individual latencies instead of overlapping them. Matters most for
+  // many-buffer reads (e.g. the golden-value verifier's captured nodes); a single-output
+  // model.run() has only one entry here either way.
+  return Promise.all(
+    reads.map(async ({ byteLength }, i) => {
+      const stagingBuffer = staging[i]!;
+      await stagingBuffer.mapAsync(GPUMapMode.READ);
+      const copy = new Float32Array(stagingBuffer.getMappedRange(0, byteLength).slice(0));
+      stagingBuffer.unmap();
+      stagingBuffer.destroy();
+      return copy;
+    }),
+  );
 }

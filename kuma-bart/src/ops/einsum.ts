@@ -1,17 +1,8 @@
 import type { OpContext, ResolvedTensor } from "../engine/context.js";
 import type { ArgValue } from "../types/manifest.js";
 import { KumaShapeError } from "../errors.js";
-import { dispatchPermute } from "./permute.js";
+import { permuteMaybeComplex } from "./permute.js";
 import { planEinsum } from "../engine/einsum-plan.js";
-
-/** Permutes a tensor's real part, and — if it's complex-paired — its imaginary part
- * identically (same dims/shape; the two parts are always geometrically in lockstep). */
-function permuteMaybeComplex(ctx: OpContext, tensor: ResolvedTensor, outShape: readonly number[], dims: readonly number[]): ResolvedTensor {
-  const re = dispatchPermute(ctx, tensor.buffer, tensor.shape, outShape, dims);
-  if (!tensor.imag) return re;
-  const im = dispatchPermute(ctx, tensor.imag, tensor.shape, outShape, dims);
-  return { buffer: re.buffer, shape: re.shape, imag: im.buffer };
-}
 
 /** bmm.wgsl: a:(B,M,K), b:(B,K,N) -> out:(B,M,N). */
 function dispatchBmm(ctx: OpContext, aBuf: GPUBuffer, bBuf: GPUBuffer, batch: number, m: number, k: number, n: number): GPUBuffer {

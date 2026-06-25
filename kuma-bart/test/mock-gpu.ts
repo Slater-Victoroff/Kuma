@@ -38,6 +38,7 @@ export function createMockDevice() {
     queue: {
       writeBuffer: () => {},
       submit: () => {},
+      onSubmittedWorkDone: async () => {},
     },
   };
 
