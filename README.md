@@ -238,7 +238,7 @@ docker compose run --rm bart-test
 docker compose up bart-demo
 ```
 
-The demo's model picker lists whatever `.iph` files are in `artifacts/`. After running `export`, open the demo and select `simple.iph` from the dropdown.
+The demo's model picker lists whatever `.iph` files are in `artifacts/`. There are already several models checked in there (`3mbunny.iph`, `3mbeauty.iph`, `3mbosphorus.iph`, `3mhoney.iph`, and the tiny acceptance-test `simple.iph`), so you can spin up `bart-demo` and start poking around without running the export step first.
 
 ---
 
