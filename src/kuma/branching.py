@@ -19,6 +19,7 @@ import torch.export
 from kuma.golden import capture_golden, namespace_golden
 from kuma.graph import serialize_graph
 from kuma.kernels import load_kernels
+from kuma.manifest import build_playback_meta
 from kuma.pack_weights import pack_weights
 
 
@@ -103,9 +104,21 @@ def compile_branching(
     branch_input_output_index: int,
     branch_eps: list[torch.export.ExportedProgram],
     branch_example_inputs: list[tuple] | None = None,
+    *,
+    fps: float | None = None,
+    duration_seconds: float | None = None,
 ) -> Any:
     """
     Assemble a branching Package.
+
+    fps/duration_seconds — optional playback metadata: how many real seconds a full
+    sweep of the router's normalized time input (t in [0,1]) should take. Neither is
+    derivable from the branches themselves (a model has no intrinsic notion of "real
+    time" -- only the caller, who knows how this multi-segment export was actually
+    authored/timed, does). A runtime falls back to its own default sweep speed when
+    omitted, same as before this existed -- this is exactly the kind of model where it
+    matters most, since different multi-segment exports are commonly authored at
+    different speeds, and a runtime has no way to tell just from the graph.
 
     router_input_names  — top-level model input names the snippet reads (these become
                            the manifest's own `inputs`).
@@ -263,6 +276,9 @@ def compile_branching(
         "warnings": warnings,
         "unsupported_ops": [],
     }
+    playback = build_playback_meta(fps, duration_seconds)
+    if playback is not None:
+        manifest["playback"] = playback
 
     debug_report = (
         "# Kuma — Branching Export Debug Report\n\n"

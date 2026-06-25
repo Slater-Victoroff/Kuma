@@ -5,6 +5,10 @@
  * tests can assert "this op dispatched N kernels" (e.g. 0 for free passthroughs). */
 export function createMockDevice() {
   const dispatches: number[] = [];
+  // Tracks every buffer .destroy() is called on -- e.g. for asserting a pooled buffer
+  // (which must persist across calls, see context.ts's BufferPoolState) is never one
+  // of them, the same way `dispatches` lets a test assert dispatch counts.
+  const destroyedBuffers = new Set<object>();
 
   const pass = {
     setPipeline: () => {},
@@ -16,13 +20,16 @@ export function createMockDevice() {
   };
 
   function fakeBuffer(size: number) {
-    return {
+    const buffer = {
       size,
       mapAsync: async () => {},
       getMappedRange: (_offset = 0, length: number = size) => new ArrayBuffer(length),
       unmap: () => {},
-      destroy: () => {},
+      destroy: () => {
+        destroyedBuffers.add(buffer);
+      },
     };
+    return buffer;
   }
 
   const device = {
@@ -42,5 +49,5 @@ export function createMockDevice() {
     },
   };
 
-  return { device: device as unknown as GPUDevice, pass, dispatches };
+  return { device: device as unknown as GPUDevice, pass, dispatches, destroyedBuffers };
 }

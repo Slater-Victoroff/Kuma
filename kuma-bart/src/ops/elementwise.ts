@@ -22,9 +22,17 @@ function sameShape(a: readonly number[], b: readonly number[]): boolean {
  * length, landing on whatever this GPU's robust-buffer-access default returns for an
  * out-of-bounds storage read (here: 0), turning a real-but-small divisor into 0 and the
  * result into +-Infinity. */
-function resolveOperand(ctx: OpContext, arg: ArgValue, shape: readonly number[]): ResolvedTensor {
+function resolveOperand(ctx: OpContext, arg: ArgValue, shape: readonly number[], label: "a" | "b"): ResolvedTensor {
   if (typeof arg === "number") {
-    return { buffer: ctx.uploadConstant(new Float32Array(numElements(shape)).fill(arg)), shape: [...shape] };
+    // arg is graph-structure-derived (a literal fixed at manifest-build time), never
+    // from actual input data -- same caching rationale as ctx.uniform/uniformTyped
+    // (see context.ts), so cached forever per-node rather than rebuilt and
+    // re-uploaded every call. label disambiguates a-side vs b-side in case a single
+    // node's binary op ever has both operands as literals.
+    const buffer = ctx.getOrUploadConstant(`operand:${ctx.node.name}:${label}`, () =>
+      new Float32Array(numElements(shape)).fill(arg),
+    );
+    return { buffer, shape: [...shape] };
   }
   const tensor = ctx.resolve(arg);
   if (sameShape(tensor.shape, shape)) {
@@ -106,8 +114,8 @@ function binaryElementwise(kernelName: string, complexPolicy: ComplexPolicy = "u
     if (!shape) {
       throw new KumaShapeError(`Op "${node.target}" (node "${node.name}") is missing an output shape in the manifest.`);
     }
-    const a = resolveOperand(ctx, aArg!, shape);
-    const b = resolveOperand(ctx, bArg!, shape);
+    const a = resolveOperand(ctx, aArg!, shape, "a");
+    const b = resolveOperand(ctx, bArg!, shape, "b");
     const n = numElements(shape);
     const realOut = dispatchBinary(ctx, kernelName, a.buffer, b.buffer, shape, n);
 

@@ -3,7 +3,7 @@ import type { GraphNode, KumaManifest } from "../src/types/manifest.js";
 import { runGraph } from "../src/engine/scheduler.js";
 import { findLinearWeightElisions } from "../src/ops/linear.js";
 import { KumaUnsupportedOpError } from "../src/errors.js";
-import type { ResolvedTensor } from "../src/engine/context.js";
+import { BUFFER_POOL_DEPTH, createBufferPoolState, type ResolvedTensor } from "../src/engine/context.js";
 import { createMockDevice } from "./mock-gpu.js";
 
 describe("findLinearWeightElisions", () => {
@@ -941,5 +941,134 @@ describe("runGraph (mocked GPUDevice — structural checks only, no real compute
     // leading dims [1,3,2] preserved, only the last dim (4 -> 5) changes.
     expect(outputs[0]!.shape).toEqual([1, 3, 2, 5]);
     expect(dispatches).toHaveLength(1);
+  });
+});
+
+describe("runGraph buffer pooling (BufferPoolState — see engine/context.ts)", () => {
+  function inputBuffersFor(device: GPUDevice): Map<string, ResolvedTensor> {
+    return new Map([["x", { buffer: device.createBuffer({ size: 16, usage: 0 } as GPUBufferDescriptor), shape: [4] }]]);
+  }
+
+  it("without a shared bufferPool (the default), repeated calls never alias each other's buffers", async () => {
+    const { device } = createMockDevice();
+    const manifest = buildReluManifest();
+    const params = {
+      device,
+      manifest,
+      kernels: new Map([["relu.wgsl", "// fake"]]),
+      pipelineCache: new Map(),
+      weightBuffers: new Map(),
+      inputBuffers: inputBuffersFor(device),
+    };
+
+    const first = await runGraph(params);
+    const second = await runGraph(params);
+
+    expect(first[0]!.buffer).not.toBe(second[0]!.buffer);
+  });
+
+  it("with a shared bufferPool, a node's output buffer is reused exactly every BUFFER_POOL_DEPTH calls", async () => {
+    const { device } = createMockDevice();
+    const manifest = buildReluManifest();
+    const bufferPool = createBufferPoolState();
+    const params = {
+      device,
+      manifest,
+      kernels: new Map([["relu.wgsl", "// fake"]]),
+      pipelineCache: new Map(),
+      weightBuffers: new Map(),
+      inputBuffers: inputBuffersFor(device),
+      bufferPool,
+    };
+
+    // Sequential (awaited one at a time) calls, BUFFER_POOL_DEPTH + 2 of them, so the
+    // ring wraps around at least once.
+    const buffers: GPUBuffer[] = [];
+    for (let i = 0; i < BUFFER_POOL_DEPTH + 2; i++) {
+      const outputs = await runGraph(params);
+      buffers.push(outputs[0]!.buffer);
+    }
+
+    // Generation N and generation N + BUFFER_POOL_DEPTH land on the same ring slot.
+    expect(buffers[BUFFER_POOL_DEPTH]).toBe(buffers[0]);
+    expect(buffers[BUFFER_POOL_DEPTH + 1]).toBe(buffers[1]);
+    // Every other pair within one rotation is a genuinely distinct buffer.
+    for (let i = 0; i < BUFFER_POOL_DEPTH; i++) {
+      for (let j = i + 1; j < BUFFER_POOL_DEPTH; j++) {
+        expect(buffers[i]).not.toBe(buffers[j]);
+      }
+    }
+  });
+
+  it("pooled buffers are never destroyed by runGraph's own end-of-call cleanup", async () => {
+    const { device, destroyedBuffers } = createMockDevice();
+    const manifest = buildReluManifest();
+    const bufferPool = createBufferPoolState();
+    const params = {
+      device,
+      manifest,
+      kernels: new Map([["relu.wgsl", "// fake"]]),
+      pipelineCache: new Map(),
+      weightBuffers: new Map(),
+      inputBuffers: inputBuffersFor(device),
+      bufferPool,
+    };
+
+    const seenBuffers = new Set<GPUBuffer>();
+    for (let i = 0; i < BUFFER_POOL_DEPTH + 2; i++) {
+      const outputs = await runGraph(params);
+      seenBuffers.add(outputs[0]!.buffer);
+    }
+
+    for (const buffer of seenBuffers) {
+      expect(destroyedBuffers.has(buffer as unknown as object)).toBe(false);
+    }
+  });
+
+  it("concurrent (not individually-awaited) calls sharing a pool never lose or double-assign a generation", async () => {
+    // Mirrors how demo/main.ts actually drives this: multiple runToGpu() calls fired
+    // without awaiting each one first, relying on acquireGenerationSlot/
+    // releaseGenerationSlot (engine/context.ts) to keep concurrent calls safe. This is
+    // the scenario where a subtle off-by-one or a missed atomicity guarantee in the
+    // generation-counter scheme would actually show up -- a purely sequential,
+    // one-call-at-a-time test (the test above) can't exercise this at all, since by
+    // the time call N starts, call N-1's pool slot has always long since been
+    // confirmed free.
+    //
+    // Deliberately *not* assuming array index == assigned generation order below: when
+    // every call is fired in the same synchronous loop before any of them has reached
+    // its own await, which one's continuation actually runs first is a microtask-
+    // scheduling detail, not something this test can or should pin down. The
+    // invariants checked here hold regardless of that order.
+    const { device } = createMockDevice();
+    const manifest = buildReluManifest();
+    const bufferPool = createBufferPoolState();
+    const callCount = BUFFER_POOL_DEPTH + 2;
+
+    const results = await Promise.all(
+      Array.from({ length: callCount }, () =>
+        runGraph({
+          device,
+          manifest,
+          kernels: new Map([["relu.wgsl", "// fake"]]),
+          pipelineCache: new Map(),
+          weightBuffers: new Map(),
+          inputBuffers: inputBuffersFor(device),
+          bufferPool,
+        }),
+      ),
+    );
+
+    // Every call must have advanced callGeneration exactly once -- a lost update
+    // (two concurrent calls both reading the same stale value) would leave this short
+    // of callCount; a double-increment would overshoot it.
+    expect(bufferPool.callGeneration).toBe(callCount);
+
+    // The pool must have rotated through exactly BUFFER_POOL_DEPTH distinct buffers
+    // across all callCount calls -- not fewer (which would mean two different
+    // generations incorrectly collided on one slot) and not more (which would mean
+    // the ring didn't actually wrap around / pool to begin with).
+    const distinctBuffers = new Set(results.map((outputs) => outputs[0]!.buffer));
+    expect(distinctBuffers.size).toBe(Math.min(callCount, BUFFER_POOL_DEPTH));
   });
 });

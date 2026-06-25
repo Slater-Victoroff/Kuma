@@ -1,9 +1,6 @@
-/** Renders a model output buffer directly to a canvas via a tiny WebGPU render
- * pipeline -- no CPU round-trip. The old path (readBuffers -> per-pixel JS loop
- * deinterleaving CHW into RGBA -> ctx2d.putImageData) cost real time that never showed
- * up in any GPU profile, since none of it was GPU work. This reads the compute output
- * storage buffer directly in a fragment shader instead.
- */
+/** Renders a model output buffer directly to a canvas via a WebGPU render
+ * pipeline — no CPU round-trip. Reads the compute output storage buffer
+ * directly in a fragment shader instead of deinterleaving CHW→RGBA in JS. */
 
 const SHADER_SOURCE = `
 struct Params {
@@ -21,9 +18,7 @@ struct VertexOut {
   @location(0) uv: vec2<f32>,
 };
 
-// Fullscreen quad (two triangles), no vertex buffer needed -- positions/uvs are baked
-// in and indexed by vertex_index. uv.y=0 maps to the top of the canvas, matching CHW
-// data's row-major (row 0 = top) convention.
+// Fullscreen quad from vertex_index — no vertex buffer needed.
 @vertex
 fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOut {
   var positions = array<vec2<f32>, 6>(
@@ -40,8 +35,7 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOut {
   return out;
 }
 
-// CHW (or NCHW with N=1) float data, values assumed roughly in [0,1] -- same clamping
-// the old CPU path did, just per-pixel on the GPU instead of in a JS loop.
+// CHW (or NCHW with N=1) float data clamped to [0, 1].
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
   let x = min(u32(in.uv.x * f32(params.width)), params.width - 1u);
@@ -73,7 +67,7 @@ export class GpuFrameRenderer {
   ) {
     const context = canvas.getContext("webgpu");
     if (!context) {
-      throw new Error("Failed to get a WebGPU canvas context (browser/canvas doesn't support canvas.getContext('webgpu')).");
+      throw new Error("Failed to get a WebGPU canvas context.");
     }
     this.context = context;
     this.format = navigator.gpu.getPreferredCanvasFormat();
@@ -91,10 +85,8 @@ export class GpuFrameRenderer {
     });
   }
 
-  /** `shape` is the output tensor's shape, NCHW (N=1) or CHW; channels must be 1 or 3 --
-   * same constraints the old CPU renderFrame() had. No-ops (returns false) rather than
-   * throwing for an unsupported shape, since this is a best-effort visualizer, not part
-   * of the model-execution contract. */
+  /** `shape` is NCHW (N=1) or CHW; channels must be 1 or 3. Returns false for
+   * unsupported shapes rather than throwing — this is a best-effort visualizer. */
   render(buffer: GPUBuffer, shape: readonly number[]): boolean {
     const dims = shape.length === 4 ? shape.slice(1) : shape;
     if (dims.length !== 3) return false;

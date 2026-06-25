@@ -2,10 +2,11 @@ function paddedSize(byteLength: number): number {
   return Math.max(4, Math.ceil(byteLength / 4) * 4);
 }
 
-/** Every tensor (weight, input, or intermediate node output) gets its own dedicated
- * buffer — no pooling/reuse/aliasing in v1, mirroring the Python compiler's own
- * "no buffer planning yet" Step 1 scope. STORAGE|COPY_SRC|COPY_DST covers every use: as
- * a kernel's input/output binding, and as the source of a final readback copy. */
+/** Allocates one storage buffer of `byteLength` (padded) bytes. Callers decide their
+ * own reuse policy -- e.g. OpContext.createBuffer pools the buffers this returns
+ * across calls (see engine/context.ts's BufferPoolState), rather than this function
+ * tracking any lifecycle itself. STORAGE|COPY_SRC|COPY_DST covers every use: as a
+ * kernel's input/output binding, and as the source of a final readback copy. */
 export function createStorageBuffer(device: GPUDevice, byteLength: number): GPUBuffer {
   return device.createBuffer({
     size: paddedSize(byteLength),

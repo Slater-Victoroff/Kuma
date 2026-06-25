@@ -4,9 +4,11 @@ import { fileURLToPath } from "node:url";
 export default defineConfig({
   build: {
     lib: {
-      entry: fileURLToPath(new URL("./src/index.ts", import.meta.url)),
+      entry: {
+        index: fileURLToPath(new URL("./src/index.ts", import.meta.url)),
+        "player/KumaPlayer": fileURLToPath(new URL("./src/player/KumaPlayer.ts", import.meta.url)),
+      },
       formats: ["es"],
-      fileName: () => "index.js",
     },
     rollupOptions: {
       external: ["fflate"],

@@ -31,7 +31,7 @@ function approxEqual(golden: number, actual: number): boolean {
 }
 
 export interface FieldDiff {
-  field: "n" | "mean" | "min" | "max" | `first[${number}]` | `spread[${number}]`;
+  field: "n" | "finite" | "mean" | "min" | "max" | `first[${number}]` | `spread[${number}]`;
   golden: number;
   actual: number;
 }
@@ -67,6 +67,16 @@ function compareTensor(node: string, part: "re" | "im", golden: GoldenTensorStat
   }
 
   const actual = summarize(actualData, golden.first.length);
+  // Exact, not approxEqual -- a NaN/Inf appearing where golden has none (or vice
+  // versa) is exactly the class of bug this project has hit before (see norm.ts's eps
+  // fallback history), and ordinary float32 reduction-order differences between a GPU
+  // kernel and eager PyTorch don't flip a normal finite value into NaN/Infinity or
+  // back -- that takes an actual operation like 0/0 or overflow, not summation order.
+  // mean/min/max alone can miss this: a handful of stray NaNs in an otherwise-large,
+  // otherwise-correct-looking tensor can hide inside `mean` (NaN poisons it, which
+  // would already be caught) but a small *count* mismatch with finite values still in
+  // range elsewhere isn't guaranteed to surface through first[]/spread[]'s sampling.
+  if (golden.finite !== actual.finite) diffs.push({ field: "finite", golden: golden.finite, actual: actual.finite });
   if (!approxEqual(golden.mean, actual.mean)) diffs.push({ field: "mean", golden: golden.mean, actual: actual.mean });
   if (!approxEqual(golden.min, actual.min)) diffs.push({ field: "min", golden: golden.min, actual: actual.min });
   if (!approxEqual(golden.max, actual.max)) diffs.push({ field: "max", golden: golden.max, actual: actual.max });

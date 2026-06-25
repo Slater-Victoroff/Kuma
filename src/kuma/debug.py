@@ -8,65 +8,6 @@ import torch
 import torch.export
 
 
-# Ops we expect to have a WebGPU lowering in a future step.
-_LIKELY_SUPPORTED: frozenset[str] = frozenset(
-    {
-        "aten.convolution.default",
-        "aten.add.Tensor",
-        "aten.add.Scalar",
-        "aten.mul.Tensor",
-        "aten.mul.Scalar",
-        "aten.relu.default",
-        "aten.relu_.default",
-        "aten.gelu.default",
-        "aten.silu.default",
-        "aten.hardswish.default",
-        "aten.mm.default",
-        "aten.addmm.default",
-        "aten.bmm.default",
-        "aten.t.default",
-        "aten.view.default",
-        "aten.reshape.default",
-        "aten.permute.default",
-        "aten.expand.default",
-        "aten.clone.default",
-        "aten.cat.default",
-        "aten.mean.dim",
-        "aten.sum.dim_IntList",
-        "aten.native_layer_norm.default",
-        "aten.native_batch_norm.default",
-        "aten._native_batch_norm_legit_no_training.default",
-        "aten.native_group_norm.default",
-        "aten.max_pool2d_with_indices.default",
-        "aten.avg_pool2d.default",
-        "aten._adaptive_avg_pool2d.default",
-        "aten.upsample_nearest2d.vec",
-        "aten.upsample_bilinear2d.vec",
-        "aten.pixel_shuffle.default",
-        "aten.clamp.default",
-        "aten.hardtanh.default",
-        "aten.sigmoid.default",
-        "aten.tanh.default",
-        "aten.exp.default",
-        "aten.log.default",
-        "aten.sqrt.default",
-        "aten.rsqrt.default",
-        "aten.pow.Tensor_Scalar",
-        "aten.sub.Tensor",
-        "aten.div.Tensor",
-        "aten.div.Scalar",
-        "aten.neg.default",
-        "aten.abs.default",
-        "aten.transpose.int",
-        "aten.select.int",
-        "aten.slice.Tensor",
-        "aten.unsqueeze.default",
-        "aten.squeeze.dim",
-        "aten.flatten.using_ints",
-    }
-)
-
-
 def _total_params(ep: torch.export.ExportedProgram) -> int:
     total = sum(t.numel() for t in ep.state_dict.values())
     constants = getattr(ep, "constants", None) or {}
@@ -111,25 +52,21 @@ def generate_debug_report(
     lines += [""]
 
     # ── ATen ops ─────────────────────────────────────────────────────────────
-    unsupported: list[str] = []
+    # Whether kuma-bart (the WebGPU runtime, see ../../kuma-bart/README.md) actually
+    # has a kernel for a given op isn't something this report can determine -- Python
+    # has no way to introspect a TypeScript module, and a hand-maintained guess here
+    # would only ever drift out of sync with kuma-bart's real op coverage (which it
+    # did, for a long time, before being removed). kuma-bart's own opRegistry fails
+    # loudly (KumaUnsupportedOpError) at runtime for anything it doesn't actually
+    # support -- that's the authoritative answer, not a static list in the compiler.
     lines += [
         "## ATen Ops Encountered",
-        "| Op | Count | Likely WebGPU-ready |",
-        "|----|------:|:-------------------:|",
+        "| Op | Count |",
+        "|----|------:|",
     ]
     for target, count in sorted(ops_seen.items()):
-        ready = "yes" if target in _LIKELY_SUPPORTED else "**no**"
-        lines.append(f"| `{target}` | {count} | {ready} |")
-        if target not in _LIKELY_SUPPORTED:
-            unsupported.append(target)
+        lines.append(f"| `{target}` | {count} |")
     lines += [""]
-
-    if unsupported:
-        lines += ["## Unsupported / Unrecognized Ops"]
-        lines.append("These ops have no planned WebGPU lowering yet:")
-        for op in sorted(unsupported):
-            lines.append(f"- `{op}`")
-        lines += [""]
 
     # ── Weights ──────────────────────────────────────────────────────────────
     lines += [

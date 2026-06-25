@@ -53,7 +53,11 @@ export function rsubScalarHandler(ctx: OpContext): void {
   const shape = node.meta.shape ?? input.shape;
   const n = numElements(shape);
 
-  const scalarBuffer = ctx.uploadConstant(new Float32Array(n).fill(scalarArg));
+  // scalarArg is graph-structure-derived (a literal fixed at manifest-build time),
+  // never from actual input data -- same caching rationale as ctx.uniform/uniformTyped
+  // (see context.ts), so this is cached forever per-node rather than rebuilt and
+  // re-uploaded every single call.
+  const scalarBuffer = ctx.getOrUploadConstant(`rsub:${node.name}`, () => new Float32Array(n).fill(scalarArg));
   const out = ctx.createBuffer(shape);
   ctx.dispatchKernel("sub.wgsl", [scalarBuffer, input.buffer, out, ctx.uniform([n])], n);
 

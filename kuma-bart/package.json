@@ -6,6 +6,16 @@
   "main": "dist/index.js",
   "module": "dist/index.js",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./player": {
+      "import": "./dist/player/KumaPlayer.js",
+      "types": "./dist/player/KumaPlayer.d.ts"
+    }
+  },
   "scripts": {
     "typecheck": "tsc --noEmit",
     "build": "vite build",

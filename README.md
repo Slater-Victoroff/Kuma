@@ -4,13 +4,18 @@ PyTorch `torch.export` → `.iph` compiler/exporter.
 
 Kuma captures a PyTorch inference graph with `torch.export`, packs its weights into a
 contiguous binary blob, and bundles everything into a single self-contained `.iph` package
-(a zip file). Kuma is **not** a runtime, **not** a training library, and **not** a WebGPU
-framework — `.iph` is just the data contract that a separate WebGPU runtime will eventually
-consume.
+(a zip file). Kuma itself is **not** a runtime, **not** a training library, and **not** a
+WebGPU framework — `.iph` is the data contract a separate WebGPU runtime consumes.
 
 ```
-PyTorch Model -> torch.export -> Kuma -> model.iph
+PyTorch Model -> torch.export -> Kuma -> model.iph -> kuma-bart (WebGPU) -> pixels
 ```
+
+That runtime is **[`kuma-bart`](kuma-bart/)**, in this same repo — a WebGPU interpreter
+that loads a `.iph` package and actually runs it live in the browser. It's functional
+today (a real multi-branch model plays back interactively), with the caveat that there's
+no kernel fusion or general buffer/memory planning yet (see "What this is not yet" below,
+and `kuma-bart/README.md` for what its runtime actually does and how it does it).
 
 ## Scope (v0)
 
@@ -20,8 +25,9 @@ PyTorch Model -> torch.export -> Kuma -> model.iph
 - Target ops: Conv2d, Linear, Add, Mul, GELU, ReLU, Reshape, Permute, Concatenate, Slice, plus
   whatever else `torch.export` traces cleanly (BatchNorm/LayerNorm/GroupNorm, pooling, etc. all
   export fine — they just may not have a WGSL kernel yet, see `unsupported_ops` below).
-- WGSL kernels are embedded in every package, but there's no WebGPU runtime yet to execute them
-  (no fusion, no buffer planning) — that's Step 2+.
+- WGSL kernels are embedded in every package, and `kuma-bart` actually executes them now —
+  but with no kernel fusion or general buffer/memory planning yet (Step 2+; the `.iph`
+  format doesn't carry the information a real planner would need).
 
 ## Install
 
@@ -97,6 +103,17 @@ example_inputs = (torch.randn(1, 3, 512, 512),)  # match the real input shape/dt
 kuma.export_model(model, example_inputs, out="artifacts/mymodel.iph")
 ```
 
+For a model with a normalized `[0,1]` time-like input meant to be scrubbed or played
+back, pass through whatever `fps`/`duration_seconds` *your own* model/training code
+actually knows — neither is recoverable from the graph itself. This is exactly what the
+Niko/Nika family's own export script does for its multi-segment animated checkpoints:
+it already knows `total_frames`, takes `--fps` as a CLI flag (not stored in the
+checkpoint), and passes both straight through to `export_model`/`compile_branching`:
+```python
+duration_seconds = total_frames / fps
+kuma.export_model(model, example_inputs, out="artifacts/mymodel.iph", fps=fps, duration_seconds=duration_seconds)
+```
+
 ## The `.iph` format
 
 A `.iph` file is a zip archive:
@@ -121,9 +138,13 @@ A `.iph` file is a zip archive:
              "nodes": [{ "id", "name", "op", "target", "args", "kwargs", "meta",
                          "kind"?: "parameter"|"buffer"|"user_input", "weight_name"? }] },
   "warnings": ["skipped non-float32 tensor: bn.num_batches_tracked (torch.int64)"],
-  "unsupported_ops": []
+  "unsupported_ops": [],
+  "playback": { "fps": 30.0, "duration_seconds": 8.0 }
 }
 ```
+`playback` is entirely optional — omitted unless the caller passes `fps`/`duration_seconds`
+to `export_model`/`export_exported_program`/`compile`/`compile_branching` (see "Wiring up"
+above for why/how).
 Every weight entry's `byte_offset + byte_length` is guaranteed `<= len(weights.f32.bin)`, and
 `byte_length == n_elements * 4`. To read a weight back out: slice the blob at
 `[byte_offset : byte_offset + byte_length]`, interpret as little-endian float32, reshape to
@@ -136,6 +157,11 @@ args become `{"node_ref": "<node name>"}`).
 
 ## What this is not yet
 
-No kernel fusion, no buffer/memory planning, no WebGPU runtime to actually execute a `.iph`
-package — that's `@kuma/webgpu-runtime`, a separate future project. Kuma's job stops at producing
-a correct, self-describing package.
+Kuma the compiler's job stops at producing a correct, self-describing `.iph` package —
+it does no kernel fusion and no buffer/memory planning, and never will (that's not its
+job). `kuma-bart` (this repo's WebGPU runtime, see above) does execute `.iph` packages
+today, but it doesn't yet have a general buffer/memory planner or an automatic fusion
+pass either — those would need additional information in the `.iph` format itself
+(live-range/aliasing hints, fusable-subgraph annotations) that the compiler doesn't
+currently emit. That's the actual Step 2+ work, split across both halves of the
+pipeline, not a single missing "runtime" piece anymore.

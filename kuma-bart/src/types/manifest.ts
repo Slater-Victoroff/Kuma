@@ -61,6 +61,20 @@ export interface GraphNode {
   branches?: SwitchBranch[];
 }
 
+/** Optional -- omitted entirely by the Python exporter when the caller didn't provide
+ * either field (see kuma.manifest.build_playback_meta). Neither value is derivable
+ * from the graph itself: a model is just a function of its inputs, with no intrinsic
+ * notion of "real time" unless whoever authored the export actually knows it (e.g. a
+ * time-routed multi-segment model meant to play back at a specific speed). A consumer
+ * (e.g. the demo) should fall back to its own default sweep duration when this whole
+ * key, or duration_seconds specifically, is absent -- not assume every model wants the
+ * same fixed playback speed, which is exactly the bug this exists to fix. */
+export interface PlaybackMeta {
+  fps?: number;
+  /** How many real seconds a full sweep of a normalized [0,1] time input should take. */
+  duration_seconds?: number;
+}
+
 export interface KumaManifest {
   format: string;
   format_version: number;
@@ -76,6 +90,7 @@ export interface KumaManifest {
   };
   warnings: string[];
   unsupported_ops: string[];
+  playback?: PlaybackMeta;
 }
 
 export function isNodeRef(v: ArgValue): v is NodeRef {

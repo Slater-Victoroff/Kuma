@@ -24,6 +24,11 @@ services:
       - ./kuma-bart/src:/workspace/src
       - ./kuma-bart/test:/workspace/test
       - ./kuma-bart/demo:/workspace/demo
+      # tsconfig.json/vitest.config.ts are otherwise only COPY'd into the image at
+      # build time (see kuma-bart/Dockerfile) -- bind-mounted so editing either
+      # doesn't silently require a rebuild to take effect, the same as src/test/demo.
+      - ./kuma-bart/tsconfig.json:/workspace/tsconfig.json
+      - ./kuma-bart/vitest.config.ts:/workspace/vitest.config.ts
     command: npm run test
 
   bart-demo:
@@ -32,6 +37,11 @@ services:
       - ./kuma-bart/src:/workspace/src
       - ./kuma-bart/demo:/workspace/demo
       - ./artifacts:/workspace/demo/artifacts:ro
+      # Same rationale as bart-test above -- vite.demo.config.ts is otherwise only
+      # baked in at build time, which is exactly what made a fix to it look like it
+      # silently didn't work (no error, just stale behavior) until a rebuild.
+      - ./kuma-bart/vite.demo.config.ts:/workspace/vite.demo.config.ts
+      - ./kuma-bart/tsconfig.json:/workspace/tsconfig.json
     ports:
       - "5173:5173"
     command: npm run demo

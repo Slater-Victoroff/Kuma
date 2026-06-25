@@ -30,11 +30,21 @@ def _dtype_str(dtype: Any) -> str | None:
     return _DTYPE_NAMES.get(dtype, str(dtype))
 
 
-def _node_val_meta(node_name: str, graph_nodes: list[dict[str, Any]]) -> dict[str, Any]:
-    for n in graph_nodes:
-        if n["name"] == node_name:
-            return n.get("meta", {})
-    return {}
+def build_playback_meta(fps: float | None, duration_seconds: float | None) -> dict[str, float] | None:
+    """Neither value is derivable from the graph itself -- a model is just a function
+    of its inputs, with no intrinsic notion of "real time" unless the caller actually
+    knows it (e.g. a time-routed multi-segment export authored at a given fps/duration).
+    Returns None (not e.g. a dict of zeros) when the caller provides neither, so the
+    manifest's optional "playback" key is simply omitted -- a runtime falls back to its
+    own default sweep duration in that case, same as before this existed. Shared by
+    kuma.compiler.compile and kuma.branching.compile_branching, the two manifest-
+    building entry points that accept this metadata."""
+    meta: dict[str, float] = {}
+    if fps is not None:
+        meta["fps"] = fps
+    if duration_seconds is not None:
+        meta["duration_seconds"] = duration_seconds
+    return meta or None
 
 
 def build_manifest(

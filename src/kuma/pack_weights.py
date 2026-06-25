@@ -20,6 +20,7 @@ def pack_weights(
     Returns:
         blob      — raw bytes (little-endian float32)
         entries   — list of dicts suitable for the manifest "weights" array
+        skipped   — names of non-float32 tensors that were dropped (e.g. "name (torch.int64)")
     """
     # ep.state_dict holds lifted parameters and buffers
     all_tensors: dict[str, torch.Tensor] = dict(ep.state_dict)

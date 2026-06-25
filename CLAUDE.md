@@ -4,9 +4,11 @@ PyTorch `torch.export` → `.iph` compiler/exporter (Step 1 of a Torch→WebGPU 
 
 Kuma captures a PyTorch inference graph, packs its weights, and bundles everything into a
 self-contained `.iph` package (a zip: `manifest.json`, `weights.f32.bin`, `kernels/*.wgsl`,
-`debug_report.md`). Kuma is not a runtime, not a training library, and not a WebGPU framework —
-the `.iph` file is the contract between this compiler and the (separate) WebGPU runtime that
-will eventually execute it.
+`debug_report.md`). Kuma itself is not a runtime, not a training library, and not a WebGPU
+framework — the `.iph` file is the contract between this compiler and `kuma-bart`, the WebGPU
+runtime that executes it. `kuma-bart/` lives in this same repo (own README at
+`kuma-bart/README.md`) — this file (`CLAUDE.md`) covers the Python compiler; see
+"kuma-bart (WebGPU runtime)" below for its environment/test/demo commands.
 
 ## Environment
 
@@ -49,10 +51,34 @@ Artifacts land in `./artifacts/` (bind-mounted at `/workspace/artifacts` in the 
 Spot-check the output:
 - `artifacts/simple.iph` — the self-contained package (zip); should contain `manifest.json`,
   `weights.f32.bin`, `kernels/*.wgsl`, `debug_report.md`
-- `artifacts/simple/debug_report.md` — ops table, weight table, unsupported ops
+- `artifacts/simple/debug_report.md` — ops table, weight table, warnings (no WebGPU-readiness
+  guessing here — kuma-bart's own `opRegistry` is the authoritative answer to "is this op
+  supported," not a static list in the compiler; see `kuma-bart/README.md`)
 - `artifacts/simple/manifest.json` — full bundle descriptor; `byte_offset + byte_length` must be consistent
 - `artifacts/simple/weights.f32.bin` — size should match sum of `byte_length` fields in manifest
 - `artifacts/simple/exported_graph.json` — raw FX node list with `weight_name` on parameter placeholders (debug-dir only; not part of the `.iph` contract since the manifest already embeds the graph)
+
+## kuma-bart (WebGPU runtime)
+
+`kuma-bart/` is the TypeScript/WebGPU runtime that actually executes a `.iph` package —
+full architecture, design rationale, and usage docs are in `kuma-bart/README.md`, not
+duplicated here. Same environment situation as the Python side applies on some dev
+boxes: no usable local Node (system Node can be too old for vite/vitest) and no Docker
+group permissions either, so check which one actually works in your environment before
+assuming a command below will run as-is.
+
+```bash
+# From repo root -- typecheck + vitest
+docker compose run --rm bart-test
+
+# From repo root -- serves the interactive demo at localhost:5173, bind-mounting this
+# repo's artifacts/ (read-only) at demo/artifacts/ -- the same place `export` writes to
+docker compose up bart-demo
+```
+
+The demo's default `.iph` path field expects something under `/artifacts/...` — run
+`docker compose run --rm export` first (or point it at any other `.iph` already in
+`./artifacts/`) before loading it in the demo.
 
 ## Using with a real Niko/Nika model (from another container)
 
@@ -156,7 +182,9 @@ src/kuma/
   debug.py          # debug report generator (generate_debug_report)
   package_iph.py    # Package dataclass: .save() writes the .iph zip, .write_dir() writes loose files
   kernels/          # embedded WGSL kernels — elementwise binary/unary ops, matmul/conv
-                     # (incl. transposed), reductions, norm (layer/batch/group), pooling
+                     # (incl. transposed, plus depthwise/pointwise-specialized fast paths
+                     # conv2d_depthwise.wgsl/conv2d_pointwise.wgsl alongside the general
+                     # conv2d.wgsl), reductions, norm (layer/batch/group), pooling
                      # (max/avg/adaptive-avg), upsampling (nearest/bilinear), pixel-shuffle,
                      # and shape ops (reshape/permute/concat/slice) — bundled into every
                      # .iph package. See kernels/__init__.py for the full list.
@@ -170,13 +198,20 @@ artifacts/          # git-ignored; created by the exporter at runtime
 
 - Inference only, static shapes, float32 only.
 - `torch.export.export` is the primary capture path.
-- WGSL kernels are embedded in every `.iph` package, but there is no WebGPU runtime yet to execute
-  them — no kernel fusion or memory/buffer planning yet.
+- WGSL kernels are embedded in every `.iph` package, and `kuma-bart` does execute them now
+  — but there's still no kernel fusion or general memory/buffer planning anywhere in the
+  pipeline (the `.iph` format itself doesn't carry what a real planner would need yet).
 - Fail loudly on unsupported dtypes, non-CPU tensors, or dynamic shapes.
 - Target models: Conv/ConvNeXt/operator/decoder style (Niko/Nika family).
 
 ## What's next (Step 2+)
 
+`kuma-bart` (this repo's WebGPU interpreter) already exists and runs `.iph` packages —
+see its own README for current status. What's still genuinely ahead, split across both
+halves of the pipeline:
+
 - Op decompositions and ATen → WebGPU op lowering beyond the current kernel set
-- Buffer planning / memory layout, kernel fusion
-- A WebGPU interpreter (`@kuma/webgpu-runtime`) that consumes a `.iph` package
+- A real buffer/memory planner and a general kernel-fusion pass (today: a fixed-depth
+  buffer-reuse pool and a few hand-specialized kernels in kuma-bart, not a planner) —
+  needs the `.iph` format itself to start carrying information (live ranges, fusable
+  subgraphs) it doesn't emit yet, so this is compiler-side work as much as runtime-side

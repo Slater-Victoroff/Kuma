@@ -7,7 +7,7 @@ import { profileGraph, type ProfileReport } from "./engine/profile.js";
 import { createBufferPoolState, type BufferPoolState, type ResolvedTensor } from "./engine/context.js";
 import type { SnippetFn } from "./engine/snippets.js";
 import { KumaManifestError } from "./errors.js";
-import type { IOSpec, KumaManifest } from "./types/manifest.js";
+import type { IOSpec, KumaManifest, PlaybackMeta } from "./types/manifest.js";
 import type { GoldenData } from "./types/golden.js";
 
 /** A loaded `.iph` package, ready to run via WebGPU. */
@@ -65,6 +65,16 @@ export class KumaModel {
 
   get outputs(): readonly IOSpec[] {
     return this.manifest.outputs;
+  }
+
+  /** Optional playback metadata (fps/duration_seconds) the Python exporter embeds when
+   * the caller provided it (see kuma.manifest.build_playback_meta) -- undefined for any
+   * .iph that didn't. A caller scrubbing/playing a normalized [0,1] time input should
+   * use duration_seconds instead of assuming one fixed speed for every model -- that
+   * was a real, observed bug (different exports authored at different speeds all
+   * forced into the same hardcoded sweep duration). */
+  get playback(): PlaybackMeta | undefined {
+    return this.manifest.playback;
   }
 
   private buildInputs(inputs: Record<string, Float32Array>): {
