@@ -4,11 +4,58 @@ import { uploadWeightSlice, uploadFloat32 } from "./gpu/buffers.js";
 import { runGraph, type RunGraphOutput } from "./engine/scheduler.js";
 import { verifyAgainstGolden, warmUp, type VerifyReport } from "./engine/verify.js";
 import { profileGraph, type ProfileReport } from "./engine/profile.js";
-import { createBufferPoolState, type BufferPoolState, type ResolvedTensor } from "./engine/context.js";
+import {
+  createBufferPoolState,
+  DEFAULT_BUFFER_POOL_DEPTH,
+  DEFAULT_POOL_SIZE_THRESHOLD,
+  type BufferPoolState,
+  type ResolvedTensor,
+} from "./engine/context.js";
 import type { SnippetFn } from "./engine/snippets.js";
 import { KumaManifestError } from "./errors.js";
 import type { IOSpec, KumaManifest, PlaybackMeta } from "./types/manifest.js";
 import type { GoldenData } from "./types/golden.js";
+
+/** Tuning knobs for how aggressively the runtime trades throughput for a smaller memory
+ * footprint. All optional -- the defaults are what every model used before this existed.
+ * Aimed at shared-memory devices (Chromebooks, integrated GPUs) where VRAM *is* system
+ * RAM and the headroom for pooled buffers + multiple in-flight frames simply isn't there.
+ *
+ * The compute cost of these 3M-param models is tiny; the binding constraint is memory, so
+ * giving up the GC-pause-avoiding buffer pool and the multi-frame pipelining (neither of
+ * which buys anything on a device that can't hit 60fps anyway) is close to free here. */
+export interface KumaMemoryOptions {
+  /** Memory-constrained posture (Chromebooks, integrated GPUs): pool depth 1 -- one frame
+   * in flight, no pipelining -- which is the dominant peak-memory lever, since each extra
+   * in-flight frame is a whole extra copy of the live activation set. Leaves the pool size
+   * threshold at its default so small intermediates are still POOLED (reused across frames)
+   * rather than freed-and-reallocated every frame: zeroing the threshold as well (the old
+   * behavior) forced an allocation + mid-graph-submit storm that made playback visibly
+   * chunky, for a steady-state saving (~the pool's own footprint) that isn't worth it once
+   * the per-frame leak is fixed. A caller that truly needs the absolute floor can still set
+   * `poolSizeThreshold: 0` explicitly. Individual fields below always win if also set. */
+  lowMemory?: boolean;
+  /** Buffer-pool ring depth. Default 2; 1 disables rotation. Also caps how many frames
+   * KumaPlayer keeps in flight, since each in-flight frame needs its own live
+   * intermediates -- the dominant peak-memory term during playback. */
+  bufferPoolDepth?: number;
+  /** Bytes at or above which a buffer skips the persistent pool and is freed eagerly.
+   * Default 1 MB. Lower it to shrink steady-state footprint toward just the weights, at
+   * the cost of more allocation churn and more mid-graph GPU submits. 0 = free everything
+   * eagerly. */
+  poolSizeThreshold?: number;
+}
+
+function resolveMemoryOptions(options: KumaMemoryOptions = {}): {
+  depth: number;
+  sizeThreshold: number;
+} {
+  const depth = options.bufferPoolDepth ?? (options.lowMemory ? 1 : DEFAULT_BUFFER_POOL_DEPTH);
+  // lowMemory drops depth (the big lever) but keeps the default pool threshold -- see the
+  // KumaMemoryOptions.lowMemory doc for why zeroing it hurt smoothness for little gain.
+  const sizeThreshold = options.poolSizeThreshold ?? DEFAULT_POOL_SIZE_THRESHOLD;
+  return { depth: Math.max(1, depth), sizeThreshold: Math.max(0, sizeThreshold) };
+}
 
 /** A loaded `.iph` package, ready to run via WebGPU. */
 export class KumaModel {
@@ -25,7 +72,10 @@ export class KumaModel {
     private readonly bufferPool: BufferPoolState,
   ) {}
 
-  static async load(source: ArrayBuffer | Response | string): Promise<KumaModel> {
+  static async load(
+    source: ArrayBuffer | Response | string,
+    memory: KumaMemoryOptions = {},
+  ): Promise<KumaModel> {
     const { manifest, weights, kernels, snippets, golden } = await loadIphPackage(source);
     const device = await requestKumaDevice();
 
@@ -35,6 +85,7 @@ export class KumaModel {
       weightBuffers.set(w.name, { buffer, shape: w.shape });
     }
 
+    const { depth, sizeThreshold } = resolveMemoryOptions(memory);
     return new KumaModel(
       device,
       manifest,
@@ -45,7 +96,7 @@ export class KumaModel {
       new Map(),
       golden,
       new Map(),
-      createBufferPoolState(),
+      createBufferPoolState({ depth, sizeThreshold }),
     );
   }
 
@@ -57,6 +108,18 @@ export class KumaModel {
    * backpressure after a `runToGpu()` call. */
   get gpuDevice(): GPUDevice {
     return this.device;
+  }
+
+  /** How many run()/runRaw()/runToGpu() calls a caller should keep in flight at once.
+   * Equals this model's buffer-pool depth: submitting more than this doesn't get more
+   * frames genuinely in flight (runGraph's acquireGenerationSlot blocks at the top of the
+   * (depth+1)-th concurrent call until an earlier one's GPU work is confirmed done) and,
+   * more importantly here, each extra in-flight frame needs its own set of live
+   * intermediates -- the main thing a low-memory model is trying to avoid. KumaPlayer
+   * reads this instead of the BUFFER_POOL_DEPTH module constant so a model loaded with
+   * `{ lowMemory: true }` (depth 1) actually serializes to one frame at a time. */
+  get maxInFlight(): number {
+    return this.bufferPool.depth;
   }
 
   get inputs(): readonly IOSpec[] {

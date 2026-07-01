@@ -136,6 +136,9 @@ export async function profileGraph(params: RunGraphParams): Promise<ProfileRepor
   });
 
   const encoder = device.createCommandEncoder();
+  // See scheduler.ts / OpContext: fresh non-pooled buffers (incl. op-internal
+  // intermediates never in `resolved`) are collected here so cleanup can free them.
+  const transientBuffers = new Set<GPUBuffer>();
 
   for (let i = 0; i < dispatchNodes.length; i++) {
     const node = dispatchNodes[i]!;
@@ -143,7 +146,7 @@ export async function profileGraph(params: RunGraphParams): Promise<ProfileRepor
     const pass = encoder.beginComputePass({
       timestampWrites: { querySet, beginningOfPassWriteIndex: i * 2, endOfPassWriteIndex: i * 2 + 1 },
     });
-    const ctx = new OpContext(device, kernels, pipelineCache, pass, resolved, node, constantCache, bufferPool);
+    const ctx = new OpContext(device, kernels, pipelineCache, pass, resolved, node, constantCache, bufferPool, transientBuffers);
     handler(ctx);
     pass.end();
 
@@ -186,7 +189,7 @@ export async function profileGraph(params: RunGraphParams): Promise<ProfileRepor
   }
   for (const slots of bufferPool.pools.values()) {
     for (const buffer of slots) {
-      keep.add(buffer);
+      if (buffer) keep.add(buffer);
     }
   }
   const destroyed = new Set<GPUBuffer>();
@@ -198,6 +201,9 @@ export async function profileGraph(params: RunGraphParams): Promise<ProfileRepor
   for (const tensor of resolved.values()) {
     destroyIfTemporary(tensor.buffer);
     if (tensor.imag) destroyIfTemporary(tensor.imag);
+  }
+  for (const buffer of transientBuffers) {
+    destroyIfTemporary(buffer);
   }
 
   const perNode: OpTiming[] = dispatchNodes.map((node, i) => {

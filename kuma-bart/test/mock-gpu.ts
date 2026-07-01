@@ -9,6 +9,9 @@ export function createMockDevice() {
   // (which must persist across calls, see context.ts's BufferPoolState) is never one
   // of them, the same way `dispatches` lets a test assert dispatch counts.
   const destroyedBuffers = new Set<object>();
+  // Every buffer ever created (with its usage flags) -- lets a test measure leaks: a
+  // buffer in `createdBuffers` but not `destroyedBuffers` is still live.
+  const createdBuffers = new Set<{ usage: number }>();
 
   const pass = {
     setPipeline: () => {},
@@ -19,9 +22,10 @@ export function createMockDevice() {
     end: () => {},
   };
 
-  function fakeBuffer(size: number) {
+  function fakeBuffer(size: number, usage = 0) {
     const buffer = {
       size,
+      usage,
       mapAsync: async () => {},
       getMappedRange: (_offset = 0, length: number = size) => new ArrayBuffer(length),
       unmap: () => {},
@@ -29,14 +33,27 @@ export function createMockDevice() {
         destroyedBuffers.add(buffer);
       },
     };
+    createdBuffers.add(buffer);
     return buffer;
   }
 
   const device = {
-    createBuffer: ({ size }: { size: number }) => fakeBuffer(size),
+    createBuffer: ({ size, usage = 0 }: { size: number; usage?: number }) => fakeBuffer(size, usage),
     createShaderModule: () => ({}),
     createComputePipeline: () => ({ getBindGroupLayout: () => ({}) }),
-    createBindGroup: () => ({}),
+    // Binding a buffer that's already been .destroy()'d is exactly the real WebGPU
+    // "[Buffer] used in submit while destroyed" failure (a use-after-destroy the
+    // early-free liveness pass must never produce) -- surface it as a hard error so a
+    // test can assert against it.
+    createBindGroup: ({ entries }: { entries?: Array<{ resource?: { buffer?: object } }> } = {}) => {
+      for (const e of entries ?? []) {
+        const buf = e?.resource?.buffer;
+        if (buf && destroyedBuffers.has(buf)) {
+          throw new Error("mock-gpu: bind group references a destroyed buffer (use-after-destroy)");
+        }
+      }
+      return {};
+    },
     createCommandEncoder: () => ({
       beginComputePass: () => pass,
       copyBufferToBuffer: () => {},
@@ -49,5 +66,5 @@ export function createMockDevice() {
     },
   };
 
-  return { device: device as unknown as GPUDevice, pass, dispatches, destroyedBuffers };
+  return { device: device as unknown as GPUDevice, pass, dispatches, destroyedBuffers, createdBuffers };
 }

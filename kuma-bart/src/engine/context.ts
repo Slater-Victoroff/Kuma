@@ -24,25 +24,80 @@ export interface ResolvedTensor {
  * slot's generation comes back around, the GPU has had a real chance to actually finish
  * with its previous occupant -- see acquireGenerationSlot/releaseGenerationSlot. Not
  * tied to any one model's branch count or shape; this is a fixed rotation depth applied
- * uniformly per (node, call-index), however many of those a given manifest has. */
-export const BUFFER_POOL_DEPTH = 3;
+ * uniformly per (node, call-index), however many of those a given manifest has.
+ *
+ * Only applies to buffers below POOL_SIZE_THRESHOLD -- large spatial activations bypass
+ * the pool entirely and are allocated fresh each call, letting the WebGPU driver recycle
+ * their VRAM at the OS/driver level (not JS GC). Measured: the bunny model has 506 MB of
+ * unique intermediate buffers, 61 of which exceed 1 MB; pooling all of them at depth 3
+ * reserved ~1.5 GB of VRAM on load and OOM'd on any device without dedicated VRAM.
+ * Pooling only the small ones (<1 MB) reduces steady-state to ~30 MB while preserving
+ * the GC-pause fix for the ~210 small/medium buffers it was actually needed for.
+ *
+ * Depth 2 (down from 3): saves 33% of steady-state pool VRAM and one in-flight frame
+ * slot. On memory-constrained devices (Chromebooks, integrated-GPU laptops) that can't
+ * sustain 60fps anyway, the extra pipelining slot was not providing measurable throughput
+ * benefit. KumaPlayer's MAX_IN_FLIGHT derives from this directly.
+ *
+ * This is only the *default*; a per-model override travels on BufferPoolState.depth (see
+ * createBufferPoolState / KumaModel.load's memory options). Depth 1 disables rotation
+ * entirely -- every call reuses the one slot, which acquireGenerationSlot serializes
+ * against the GPU's completion signal, collapsing peak pool VRAM to a single generation's
+ * worth at the cost of throughput. That's the right trade on a Chromebook. */
+export const DEFAULT_BUFFER_POOL_DEPTH = 2;
+
+/** Back-compat re-export of the default depth. KumaPlayer derives a *cold-start* in-flight
+ * cap from this for the window before a model has actually loaded; once one has, it reads
+ * the model's real (possibly overridden) depth instead. */
+export const BUFFER_POOL_DEPTH = DEFAULT_BUFFER_POOL_DEPTH;
+
+/** Buffers at least this big bypass the pool and are allocated fresh each call, then freed
+ * eagerly (by scheduler.ts's liveness pass) the moment their last consumer is encoded --
+ * so peak VRAM tracks the *concurrently-live* large-activation set, not the whole graph's
+ * sum. This is only the *default*; a per-model override travels on
+ * BufferPoolState.sizeThreshold. Lowering it pushes more buffers onto that
+ * allocate-fresh/free-early path, shrinking steady-state pool footprint toward just the
+ * weights, at the cost of more allocation churn and more mid-graph submits. A threshold of
+ * 0 frees *every* intermediate at its last use -- the absolute-minimum-memory setting. */
+export const DEFAULT_POOL_SIZE_THRESHOLD = 1024 * 1024; // 1 MB
 
 /** Persists across every call sharing it (one instance lives on KumaModel, threaded
  * through exactly like pipelineCache/constantCache) -- `pools` is keyed by
  * `${node.name}::${call-index-within-that-node}` (a node can call ctx.createBuffer more
  * than once, e.g. fft.ts's multi-step intermediates), each entry a fixed-size ring of
- * BUFFER_POOL_DEPTH buffers sized once (on first use) to that exact call's byte length
- * -- safe forever after, since Kuma is a static-shape compiler: the same node always
- * produces the same shape, every single call. `callGeneration`/`confirmedGeneration`
- * guard *reuse* safety -- see acquireGenerationSlot. */
+ * BUFFER_POOL_DEPTH slots. Slots are null until the generation that first needs them,
+ * then lazily allocated and reused forever after -- this avoids allocating all depth
+ * copies upfront on first use (which previously tripled the pool footprint during
+ * warmUp). `callGeneration`/`confirmedGeneration` guard reuse safety -- see
+ * acquireGenerationSlot. */
 export interface BufferPoolState {
-  pools: Map<string, GPUBuffer[]>;
+  pools: Map<string, (GPUBuffer | null)[]>;
   callGeneration: number;
   confirmedGeneration: number;
+  /** Ring depth for this model's pool. Defaults to DEFAULT_BUFFER_POOL_DEPTH; a
+   * memory-constrained caller can lower it to 1 (no rotation). Lives here rather than as
+   * a module const so two models loaded in one page can pick different trade-offs. */
+  depth: number;
+  /** Per-model copy of the pool/early-free byte threshold. Defaults to
+   * DEFAULT_POOL_SIZE_THRESHOLD; lowering it (toward 0) shrinks steady-state footprint. */
+  sizeThreshold: number;
 }
 
-export function createBufferPoolState(): BufferPoolState {
-  return { pools: new Map(), callGeneration: 0, confirmedGeneration: -1 };
+export interface BufferPoolOptions {
+  /** Ring depth (>=1). Omit for DEFAULT_BUFFER_POOL_DEPTH. */
+  depth?: number;
+  /** Pool/early-free byte threshold (>=0). Omit for DEFAULT_POOL_SIZE_THRESHOLD. */
+  sizeThreshold?: number;
+}
+
+export function createBufferPoolState(options: BufferPoolOptions = {}): BufferPoolState {
+  return {
+    pools: new Map(),
+    callGeneration: 0,
+    confirmedGeneration: -1,
+    depth: Math.max(1, options.depth ?? DEFAULT_BUFFER_POOL_DEPTH),
+    sizeThreshold: Math.max(0, options.sizeThreshold ?? DEFAULT_POOL_SIZE_THRESHOLD),
+  };
 }
 
 /** Call once, before dispatching anything, from every entry point that shares this
@@ -60,7 +115,7 @@ export function createBufferPoolState(): BufferPoolState {
  * session's in-flight pipelining, just now owning a real correctness invariant
  * (no premature buffer reuse) instead of a soft memory-safety heuristic. */
 export async function acquireGenerationSlot(device: GPUDevice, pool: BufferPoolState): Promise<void> {
-  const reuseGeneration = pool.callGeneration - BUFFER_POOL_DEPTH;
+  const reuseGeneration = pool.callGeneration - pool.depth;
   if (reuseGeneration >= 0 && pool.confirmedGeneration < reuseGeneration) {
     await device.queue.onSubmittedWorkDone();
     pool.confirmedGeneration = pool.callGeneration - 1;
@@ -108,6 +163,15 @@ export class OpContext {
     public readonly node: GraphNode,
     private readonly constantCache: Map<string, GPUBuffer>,
     private readonly bufferPool: BufferPoolState,
+    // Every fresh (non-pooled) buffer createBuffer hands out is recorded here so the
+    // caller (scheduler/profile) can free it after the run. Without this, an op's
+    // *intra-op* intermediates -- buffers it allocates but never setOutput()s into
+    // `resolved` (e.g. floor_divide's `divided`, fft's multi-step temporaries) -- are
+    // invisible to both the early-free pass and the end-of-run cleanup (both scan only
+    // `resolved`), so they leak. Harmless in the default pool regime (those buffers come
+    // from the pool and are reused), but at sizeThreshold 0 (low-memory) every createBuffer
+    // bypasses the pool and allocates fresh, turning that blind spot into a per-frame leak.
+    private readonly transientBuffers: Set<GPUBuffer>,
   ) {}
 
   resolve(arg: ArgValue): ResolvedTensor {
@@ -125,26 +189,48 @@ export class OpContext {
     return tensor;
   }
 
-  /** Returns this call's slot in a BUFFER_POOL_DEPTH-deep ring buffer, keyed by this
+  /** Returns this call's slot in a `bufferPool.depth`-deep ring buffer, keyed by this
    * node + which createBuffer call this is within it -- sized once (lazily, on first
    * use) to `shape`'s byte length, safe to reuse forever after since the same node
    * always produces the same shape on every call (Kuma is a static-shape compiler).
    * Reuse-timing safety across calls is the scheduler's job (acquireGenerationSlot,
    * called once per runGraph/profileGraph call before any createBuffer call can
    * happen) -- by the time this runs, it's already safe to hand back whichever slot
-   * `bufferPool.callGeneration % BUFFER_POOL_DEPTH` points at. */
+   * `bufferPool.callGeneration % bufferPool.depth` points at.
+   *
+   * Slots are allocated lazily -- only the slot for the current generation is created
+   * on first encounter, not all `depth` at once. This reduces peak memory during warmUp
+   * (which previously allocated all depth copies on a node's first run) by up to
+   * `depth`×. After `depth` distinct generations have touched a node the ring is fully
+   * warm -- same steady state as before. (A low-memory model runs at depth 1, so there's
+   * no ring at all: one slot, reused, with acquireGenerationSlot serializing against the
+   * GPU between calls.)
+   *
+   * Buffers >= `bufferPool.sizeThreshold` bypass the pool and are allocated fresh -- the
+   * caller (scheduler.ts's cleanup pass) will destroy them after submit, letting the
+   * driver reclaim VRAM without going through JS GC. The call-index still increments
+   * so subsequent small-buffer calls within the same node get distinct pool keys. */
   createBuffer(shape: readonly number[]): GPUBuffer {
     const byteLength = numElements(shape) * 4;
-    const key = `${this.node.name}::${this.createBufferCallIndex++}`;
+    const callIndex = this.createBufferCallIndex++;
+    if (byteLength >= this.bufferPool.sizeThreshold) {
+      const buffer = createStorageBuffer(this.device, byteLength);
+      this.transientBuffers.add(buffer);
+      return buffer;
+    }
+    const key = `${this.node.name}::${callIndex}`;
     let slots = this.bufferPool.pools.get(key);
     if (!slots) {
-      slots = [];
-      for (let i = 0; i < BUFFER_POOL_DEPTH; i++) {
-        slots.push(createStorageBuffer(this.device, byteLength));
-      }
+      slots = new Array<GPUBuffer | null>(this.bufferPool.depth).fill(null);
       this.bufferPool.pools.set(key, slots);
     }
-    return slots[this.bufferPool.callGeneration % BUFFER_POOL_DEPTH]!;
+    const slotIndex = this.bufferPool.callGeneration % this.bufferPool.depth;
+    let buffer = slots[slotIndex];
+    if (!buffer) {
+      buffer = createStorageBuffer(this.device, byteLength);
+      slots[slotIndex] = buffer;
+    }
+    return buffer;
   }
 
   /** A zero-filled buffer of `byteLength` bytes — for bias-less ops (e.g. conv2d/linear with no bias arg). */

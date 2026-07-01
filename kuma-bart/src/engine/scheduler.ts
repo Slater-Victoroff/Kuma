@@ -54,6 +54,10 @@ export interface RunGraphParams {
    * same lifecycle as constantCache. Defaults to a fresh (i.e. cold, unpooled-benefit)
    * state when omitted -- see createBufferPoolState. */
   bufferPool?: BufferPoolState;
+  /** Dead intermediate bytes to batch before an early-free submit (see
+   * EARLY_FREE_SUBMIT_BUDGET). Defaults to that const; a test can pass 0 to flush per
+   * buffer (the old immediate-free behavior). */
+  earlyFreeSubmitBudget?: number;
 }
 
 export interface RunGraphOutput {
@@ -79,6 +83,13 @@ export interface SwitchResolution {
   /** Branch-input bindings, uploaded from JS values — merge into `resolved` before
    * the main loop runs. */
   seeded: Map<string, ResolvedTensor>;
+}
+
+/** Recursively collect every NodeRef's node_ref string from an arg value tree. */
+function nodeRefNames(arg: ArgValue, out: string[] = []): string[] {
+  if (isNodeRef(arg)) out.push(arg.node_ref);
+  else if (Array.isArray(arg)) for (const a of arg) nodeRefNames(a, out);
+  return out;
 }
 
 /**
@@ -220,6 +231,26 @@ export function resolveSwitches(
 // itself every call, which would defeat the in-flight pipelining if left on.
 const DEBUG_TIMING = false;
 
+/** Opt-in per-frame main-thread timing (enable with `?kumatime` in the URL). Unlike
+ * DEBUG_TIMING it adds no GPU-side query overhead -- just wall-clock around the encode
+ * loop plus a count of how many queue.submit()s a frame issued, to tell apart an
+ * encode-bound frame from a submit-storm-bound one. */
+let SCHED_TIME_DEBUG: boolean | undefined;
+function schedTimeEnabled(): boolean {
+  if (SCHED_TIME_DEBUG === undefined) {
+    SCHED_TIME_DEBUG = typeof location !== "undefined" && /[?&]kumatime\b/.test(location.search);
+  }
+  return SCHED_TIME_DEBUG;
+}
+
+/** Dead-but-not-yet-submitted intermediate bytes to let pile up before ending the pass to
+ * free them. The early-free liveness pass needs a submitted pass before a buffer's memory
+ * is reclaimable, but doing that per-buffer means dozens of queue.submit()s per frame, each
+ * with real main-thread validation cost -- a big chunk of per-frame CPU on weak devices.
+ * Batching frees into ~this-sized groups cuts that to a handful of submits/frame; the cost
+ * is peak memory rising by up to this much (per in-flight frame). */
+const EARLY_FREE_SUBMIT_BUDGET = 64 * 1024 * 1024; // 64 MB
+
 /** Walks `manifest.graph.nodes` in order (already topologically sorted by the Python
  * exporter), resolving each node to a GPUBuffer and dispatching its op, then reads back
  * the tensors the `output` node points at. */
@@ -241,6 +272,67 @@ export async function runGraph(params: RunGraphParams): Promise<RunGraphOutput[]
   const elisions = findLinearWeightElisions(nodes);
   const resolved = new Map<string, ResolvedTensor>(seeded);
 
+  // Liveness pre-pass: count how many later nodes consume each intermediate's output,
+  // so we can free large non-pooled buffers (≥ bufferPool.sizeThreshold) as soon as their
+  // last consumer has been encoded -- instead of keeping all 500+ MB of intermediates
+  // alive simultaneously until the end of the encoding loop. Threshold is per-model (a
+  // low-memory model lowers it toward 0, freeing nearly everything eagerly).
+  const sizeThreshold = bufferPool.sizeThreshold;
+  const refCounts = new Map<string, number>();
+  for (const node of nodes) {
+    for (const arg of node.args) {
+      for (const ref of nodeRefNames(arg)) {
+        refCounts.set(ref, (refCounts.get(ref) ?? 0) + 1);
+      }
+    }
+  }
+  // Buffers that must never be freed early.
+  const earlyFreeExclusions = new Set<GPUBuffer>();
+  for (const t of weightBuffers.values()) {
+    earlyFreeExclusions.add(t.buffer);
+    if (t.imag) earlyFreeExclusions.add(t.imag);
+  }
+  for (const t of inputBuffers.values()) {
+    earlyFreeExclusions.add(t.buffer);
+    if (t.imag) earlyFreeExclusions.add(t.imag);
+  }
+  for (const t of seeded.values()) {
+    earlyFreeExclusions.add(t.buffer);
+    if (t.imag) earlyFreeExclusions.add(t.imag);
+  }
+  // Names whose buffers must survive past this call (model outputs and captured nodes).
+  const protectedNames = new Set<string>(params.captureNodes ?? []);
+  for (const node of nodes) {
+    if (node.op === "output") {
+      for (const arg of node.args) for (const ref of nodeRefNames(arg)) protectedNames.add(ref);
+      break;
+    }
+  }
+
+  // A single GPUBuffer is routinely shared by several resolved names: alias/passthrough/
+  // view ops (aten.alias/contiguous/to/squeeze/unsqueeze, and many reshaping ops) reuse
+  // their input's buffer rather than allocating -- see ops/passthrough.ts. So a per-name
+  // refcount hitting zero means *that name* is done, NOT that the underlying buffer is:
+  // another alias may still have pending consumers, or be a protected output. Freeing on
+  // the name's count alone destroys a buffer a later dispatch still binds -- a
+  // use-after-destroy. It stays latent at the default 1MB threshold (aliased buffers are
+  // typically small) but fires constantly at sizeThreshold 0 (low-memory mode), where
+  // every buffer is early-free-eligible. So gate the free on whether *any other* still-
+  // live or protected name maps to the same buffer. Scanning the current `resolved` set is
+  // sufficient: a future aliaser must reference a name that already holds this buffer (you
+  // can't alias a buffer without naming something that holds it), and that name's own
+  // refcount is therefore still > 0 here.
+  const bufferStillNeeded = (buf: GPUBuffer, excludingRef: string): boolean => {
+    for (const [name, t] of resolved) {
+      if (name === excludingRef) continue;
+      if (t.buffer !== buf && t.imag !== buf) continue;
+      if (protectedNames.has(name)) return true;
+      const c = refCounts.get(name);
+      if (c !== undefined && c > 0) return true;
+    }
+    return false;
+  };
+
   // Diagnostic: a GPU-side timestamp pair around the *whole* shared pass, to settle
   // directly (no CPU-side ambiguity) whether the shared pass's own GPU execution time
   // actually matches profile.ts's per-node-summed breakdown or runs much longer --
@@ -248,10 +340,26 @@ export async function runGraph(params: RunGraphParams): Promise<RunGraphOutput[]
   const debugGpuTiming = DEBUG_TIMING && device.features.has("timestamp-query");
   const debugQuerySet = debugGpuTiming ? device.createQuerySet({ type: "timestamp", count: 2 }) : undefined;
 
-  const encoder = device.createCommandEncoder();
-  const pass = encoder.beginComputePass(
+  let encoder = device.createCommandEncoder();
+  let pass = encoder.beginComputePass(
     debugQuerySet ? { timestampWrites: { querySet: debugQuerySet, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1 } } : undefined,
   );
+
+  // Fresh (non-pooled) buffers handed out by OpContext.createBuffer, including op-internal
+  // intermediates that never land in `resolved` -- collected so cleanup can free them (see
+  // OpContext's constructor note; this is the low-memory per-frame leak fix).
+  const transientBuffers = new Set<GPUBuffer>();
+
+  // Early-free batching: dead intermediates accumulate here and are freed in one
+  // pass-end/submit/destroy group once they exceed EARLY_FREE_SUBMIT_BUDGET, instead of a
+  // separate submit per buffer (see the const's note).
+  const pendingFree = new Set<GPUBuffer>();
+  let pendingFreeBytes = 0;
+  const earlyFreeSubmitBudget = params.earlyFreeSubmitBudget ?? EARLY_FREE_SUBMIT_BUDGET;
+
+  const timeDbg = schedTimeEnabled();
+  let submitCount = 0;
+  const tEncode0 = timeDbg ? performance.now() : 0;
 
   let outputNode: GraphNode | undefined;
 
@@ -298,7 +406,7 @@ export async function runGraph(params: RunGraphParams): Promise<RunGraphOutput[]
       throw new KumaUnsupportedOpError(node.target, node.name);
     }
 
-    const ctx = new OpContext(device, kernels, pipelineCache, pass, resolved, node, constantCache, bufferPool);
+    const ctx = new OpContext(device, kernels, pipelineCache, pass, resolved, node, constantCache, bufferPool, transientBuffers);
     handler(ctx);
 
     // Multi-output nodes (e.g. aten.chunk.default) register per-index results via
@@ -309,6 +417,42 @@ export async function runGraph(params: RunGraphParams): Promise<RunGraphOutput[]
         `Internal: op handler for "${node.target}" did not register an output for node "${node.name}".`,
       );
     }
+
+    // Decrement ref counts for this node's inputs. Any large intermediate whose last
+    // consumer just ran becomes freeable -- accumulate it in `pendingFree` and only end
+    // the pass / submit / destroy the whole group once it exceeds the budget, so peak VRAM
+    // stays bounded (to the live set plus one budget's worth of dead buffers) without a
+    // separate submit per buffer.
+    for (const ref of nodeRefNames(node.args.flat() as ArgValue[])) {
+      const count = refCounts.get(ref);
+      if (count === undefined) continue;
+      const newCount = count - 1;
+      refCounts.set(ref, newCount);
+      if (newCount !== 0) continue;
+      const tensor = resolved.get(ref);
+      if (!tensor || protectedNames.has(ref)) continue;
+      const buf = tensor.buffer;
+      if (buf.size >= sizeThreshold && !earlyFreeExclusions.has(buf) && !pendingFree.has(buf)
+          && !bufferStillNeeded(buf, ref)) {
+        pendingFree.add(buf);
+        pendingFreeBytes += buf.size;
+      }
+      if (tensor.imag && tensor.imag.size >= sizeThreshold && !earlyFreeExclusions.has(tensor.imag)
+          && !pendingFree.has(tensor.imag) && !bufferStillNeeded(tensor.imag, ref)) {
+        pendingFree.add(tensor.imag);
+        pendingFreeBytes += tensor.imag.size;
+      }
+    }
+    if (pendingFree.size > 0 && pendingFreeBytes >= earlyFreeSubmitBudget) {
+      pass.end();
+      device.queue.submit([encoder.finish()]);
+      submitCount++;
+      for (const buf of pendingFree) buf.destroy();
+      pendingFree.clear();
+      pendingFreeBytes = 0;
+      encoder = device.createCommandEncoder();
+      pass = encoder.beginComputePass();
+    }
   }
 
   pass.end();
@@ -318,8 +462,13 @@ export async function runGraph(params: RunGraphParams): Promise<RunGraphOutput[]
     encoder.resolveQuerySet(debugQuerySet, 0, 2, debugQueryBuffer, 0);
   }
   device.queue.submit([encoder.finish()]);
+  submitCount++;
   releaseGenerationSlot(device, bufferPool);
   const t1 = DEBUG_TIMING ? performance.now() : 0;
+  if (timeDbg) {
+    const encodeMs = performance.now() - tEncode0;
+    console.log(`[kuma-sched] encode+submit ${encodeMs.toFixed(1)}ms — ${submitCount} submit(s), ${nodes.length} nodes`);
+  }
 
   if (debugQuerySet && debugQueryBuffer) {
     const staging = device.createBuffer({ size: 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
@@ -409,7 +558,7 @@ export async function runGraph(params: RunGraphParams): Promise<RunGraphOutput[]
   }
   for (const slots of bufferPool.pools.values()) {
     for (const buffer of slots) {
-      keep.add(buffer);
+      if (buffer) keep.add(buffer);
     }
   }
   for (const t of [...outputTensors, ...capturedTensors]) {
@@ -425,6 +574,12 @@ export async function runGraph(params: RunGraphParams): Promise<RunGraphOutput[]
   for (const tensor of resolved.values()) {
     destroyIfTemporary(tensor.buffer);
     if (tensor.imag) destroyIfTemporary(tensor.imag);
+  }
+  // Op-internal intermediates that never entered `resolved` -- the resolved scan above
+  // can't see them. `destroyIfTemporary` skips any already destroyed by the early-free
+  // pass and any that are an output/pooled/weight buffer (in `keep`).
+  for (const buffer of transientBuffers) {
+    destroyIfTemporary(buffer);
   }
   if (DEBUG_TIMING) {
     const t3 = performance.now();

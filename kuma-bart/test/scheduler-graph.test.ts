@@ -204,6 +204,55 @@ describe("runGraph (mocked GPUDevice — structural checks only, no real compute
     expect(dispatches).toHaveLength(0);
   });
 
+  it("low-memory early-free does not destroy a buffer still aliased by a live node (sizeThreshold 0)", async () => {
+    const { device } = createMockDevice();
+    // x → a=relu(x) → { c=alias(a)→e=relu(c),  f=relu(a) }. `c` shares a's buffer; `e`
+    // (c's last consumer) is encoded before `f` (a's last consumer). A per-name refcount
+    // would free a's buffer when `c` hits 0 at `e`, then `f` would bind a destroyed
+    // buffer. With sizeThreshold 0 every intermediate is early-free-eligible, so this is
+    // exactly the low-memory use-after-destroy. The mock throws if a destroyed buffer is
+    // ever bound, so this passing means the buffer survived until its true last use.
+    const manifest: KumaManifest = {
+      format: "kuma",
+      format_version: 0,
+      weight_file: "weights.f32.bin",
+      endianness: "little",
+      inputs: [{ name: "x", shape: [4] }],
+      outputs: [
+        { name: "e", shape: [4] },
+        { name: "f", shape: [4] },
+      ],
+      weights: [],
+      graph: {
+        node_count: 6,
+        op_counts: { "aten.relu.default": 3, "aten.alias.default": 1 },
+        nodes: [
+          { id: 0, name: "x", op: "placeholder", target: "x", args: [], kwargs: {}, meta: { shape: [4] }, kind: "user_input" },
+          { id: 1, name: "a", op: "call_function", target: "aten.relu.default", args: [{ node_ref: "x" }], kwargs: {}, meta: { shape: [4] } },
+          { id: 2, name: "c", op: "call_function", target: "aten.alias.default", args: [{ node_ref: "a" }], kwargs: {}, meta: { shape: [4] } },
+          { id: 3, name: "e", op: "call_function", target: "aten.relu.default", args: [{ node_ref: "c" }], kwargs: {}, meta: { shape: [4] } },
+          { id: 4, name: "f", op: "call_function", target: "aten.relu.default", args: [{ node_ref: "a" }], kwargs: {}, meta: { shape: [4] } },
+          { id: 5, name: "output", op: "output", target: "output", args: [[{ node_ref: "e" }, { node_ref: "f" }]], kwargs: {}, meta: {} },
+        ],
+      },
+      warnings: [],
+      unsupported_ops: [],
+    };
+
+    const outputs = await runGraph({
+      device,
+      manifest,
+      kernels: new Map([["relu.wgsl", "// fake"]]),
+      pipelineCache: new Map(),
+      weightBuffers: new Map(),
+      inputBuffers: new Map([["x", { buffer: device.createBuffer({ size: 16, usage: 0 } as GPUBufferDescriptor), shape: [4] }]]),
+      bufferPool: createBufferPoolState({ depth: 1, sizeThreshold: 0 }),
+      earlyFreeSubmitBudget: 0, // flush per-buffer so mid-graph early-free is exercised
+    });
+
+    expect(outputs.map((o) => o.name)).toEqual(["e", "f"]);
+  });
+
   it("complex/real pairing round-trips through aten.complex/aten.real with zero dispatch", async () => {
     const { device, dispatches } = createMockDevice();
     const manifest: KumaManifest = {
@@ -546,6 +595,40 @@ describe("runGraph (mocked GPUDevice — structural checks only, no real compute
 
     expect(outputs[0]!.shape).toEqual([4]);
     expect(dispatches).toHaveLength(2);
+  });
+
+  it("low-memory (sizeThreshold 0) frees op-internal intermediates, not just node outputs", async () => {
+    // floor-div allocates an intra-op `divided` buffer (never setOutput into `resolved`)
+    // plus the node output. At sizeThreshold 0 both bypass the pool and are allocated
+    // fresh. Cleanup scans `resolved`, so without the transient-buffer tracking the
+    // `divided` buffer leaks every call -- the low-memory per-frame OOM. After the run the
+    // only live storage buffer should be the output the caller was handed.
+    const { device, destroyedBuffers, createdBuffers } = createMockDevice();
+    const inputBuffers = new Map([
+      ["a", { buffer: device.createBuffer({ size: 16, usage: 0 } as GPUBufferDescriptor), shape: [4] }],
+      ["b", { buffer: device.createBuffer({ size: 16, usage: 0 } as GPUBufferDescriptor), shape: [4] }],
+    ]);
+
+    const outputs = await runGraph({
+      device,
+      manifest: buildDivModeManifest("floor"),
+      kernels: new Map([
+        ["div.wgsl", "// fake"],
+        ["floor.wgsl", "// fake"],
+      ]),
+      pipelineCache: new Map(),
+      weightBuffers: new Map(),
+      inputBuffers,
+      bufferPool: createBufferPoolState({ depth: 1, sizeThreshold: 0 }),
+      earlyFreeSubmitBudget: 0, // flush per-buffer so mid-graph early-free is exercised
+    });
+
+    // Uniform (params) buffers are cached in constantCache and persist by design; only
+    // storage buffers are activation memory. The single survivor must be the output.
+    const liveStorage = [...createdBuffers].filter(
+      (b) => !(b.usage & GPUBufferUsage.UNIFORM) && !destroyedBuffers.has(b),
+    );
+    expect(liveStorage).toEqual([outputs[0]!.buffer]);
   });
 
   it('div_mode="trunc" (unsupported) fails loudly instead of guessing', async () => {
@@ -958,11 +1041,13 @@ describe("runGraph buffer pooling (BufferPoolState — see engine/context.ts)", 
       kernels: new Map([["relu.wgsl", "// fake"]]),
       pipelineCache: new Map(),
       weightBuffers: new Map(),
-      inputBuffers: inputBuffersFor(device),
     };
 
-    const first = await runGraph(params);
-    const second = await runGraph(params);
+    // Fresh input buffer per call, as model.ts does in production (it uploads inputs each
+    // frame) -- runGraph destroys input buffers in its end-of-call cleanup, so reusing one
+    // object across calls would bind a destroyed buffer.
+    const first = await runGraph({ ...params, inputBuffers: inputBuffersFor(device) });
+    const second = await runGraph({ ...params, inputBuffers: inputBuffersFor(device) });
 
     expect(first[0]!.buffer).not.toBe(second[0]!.buffer);
   });
@@ -977,15 +1062,15 @@ describe("runGraph buffer pooling (BufferPoolState — see engine/context.ts)", 
       kernels: new Map([["relu.wgsl", "// fake"]]),
       pipelineCache: new Map(),
       weightBuffers: new Map(),
-      inputBuffers: inputBuffersFor(device),
       bufferPool,
     };
 
     // Sequential (awaited one at a time) calls, BUFFER_POOL_DEPTH + 2 of them, so the
-    // ring wraps around at least once.
+    // ring wraps around at least once. Fresh input buffer per call (see note above) --
+    // runGraph destroys inputs in cleanup, so they can't be shared across calls.
     const buffers: GPUBuffer[] = [];
     for (let i = 0; i < BUFFER_POOL_DEPTH + 2; i++) {
-      const outputs = await runGraph(params);
+      const outputs = await runGraph({ ...params, inputBuffers: inputBuffersFor(device) });
       buffers.push(outputs[0]!.buffer);
     }
 
@@ -1010,13 +1095,13 @@ describe("runGraph buffer pooling (BufferPoolState — see engine/context.ts)", 
       kernels: new Map([["relu.wgsl", "// fake"]]),
       pipelineCache: new Map(),
       weightBuffers: new Map(),
-      inputBuffers: inputBuffersFor(device),
       bufferPool,
     };
 
+    // Fresh input buffer per call (see note above) -- runGraph destroys inputs in cleanup.
     const seenBuffers = new Set<GPUBuffer>();
     for (let i = 0; i < BUFFER_POOL_DEPTH + 2; i++) {
-      const outputs = await runGraph(params);
+      const outputs = await runGraph({ ...params, inputBuffers: inputBuffersFor(device) });
       seenBuffers.add(outputs[0]!.buffer);
     }
 

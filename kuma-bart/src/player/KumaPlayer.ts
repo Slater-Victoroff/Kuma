@@ -307,7 +307,10 @@ const TEMPLATE = `
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
-const MAX_IN_FLIGHT = BUFFER_POOL_DEPTH;
+// Cold-start fallback only: used for the window before a model has loaded. Once one has,
+// the player reads model.maxInFlight (its real, possibly lowered pool depth) instead -- so
+// a `low-memory` player serializes to a single in-flight frame. See `maxInFlight` below.
+const DEFAULT_MAX_IN_FLIGHT = BUFFER_POOL_DEPTH;
 const DEFAULT_PLAY_SWEEP_MS = 6000;
 const PLAY_MIN_FRAME_INTERVAL_MS = 1000 / 60;
 const STALL_THRESHOLD_MS = 50;
@@ -316,7 +319,7 @@ const PROFILE_WARMUP_RUNS = 5;
 // ── KumaPlayer ─────────────────────────────────────────────────────────────────
 
 export class KumaPlayer extends HTMLElement {
-  static readonly observedAttributes = ["src", "debug", "autoplay"];
+  static readonly observedAttributes = ["src", "debug", "autoplay", "low-memory", "pool-depth"];
 
   private readonly shadow: ShadowRoot;
 
@@ -341,6 +344,8 @@ export class KumaPlayer extends HTMLElement {
   private inFlight = 0;
   private pendingT: number | undefined;
   private playing = false;
+  private loadPending = false;  // true when play was clicked before model loaded
+  private loadInProgress = false;
   private playStartMs = 0;
   private capacityHits = 0;
   private requestedFrames = 0;
@@ -388,24 +393,37 @@ export class KumaPlayer extends HTMLElement {
   }
 
   connectedCallback(): void {
-    const src = this.getAttribute("src");
-    if (src) void this.load(src).catch((err: unknown) => this.logError("Load error", err));
     if (this.hasAttribute("debug")) this.setDebugVisible(true);
+    const src = this.getAttribute("src");
+    if (src) this.maybeLoad(src);
   }
 
   attributeChangedCallback(name: string, oldVal: string | null, newVal: string | null): void {
     if (!this.isConnected) return;
     if (name === "src" && newVal !== null && newVal !== oldVal) {
-      void this.load(newVal).catch((err: unknown) => this.logError("Load error", err));
+      this.maybeLoad(newVal);
     }
     if (name === "debug") {
       this.setDebugVisible(newVal !== null);
     }
   }
 
+  /** Load immediately if autoplay is set; otherwise arm the play button so the
+   * first click loads-then-plays (avoids uploading all models' weights to VRAM
+   * simultaneously on pages with multiple players). */
+  private maybeLoad(src: string): void {
+    if (this.hasAttribute("autoplay")) {
+      void this.load(src).catch((err: unknown) => this.logError("Load error", err));
+    } else {
+      this.placeholderEl.textContent = "Click ▶ to load";
+      this.playBtn.disabled = false;
+    }
+  }
+
   // ── Public API ──────────────────────────────────────────────────────────────
 
   async load(src: string): Promise<void> {
+    this.loadInProgress = true;
     this.stopPlayback();
     this.setControlsEnabled(false);
     this.canvas.style.display = "none";
@@ -414,7 +432,18 @@ export class KumaPlayer extends HTMLElement {
     this.statusEl.textContent = "";
     this.logEl.textContent = `loading ${src}…`;
 
-    this.model = await KumaModel.load(src);
+    // `low-memory` attribute → memory-constrained posture (pool depth 1 = one frame in
+    // flight, the dominant peak-memory lever; small buffers still pooled). For Chromebooks
+    // / integrated GPUs where VRAM is shared system RAM. `pool-depth="N"` overrides the
+    // depth explicitly (and thus how many frames the player pipelines, since maxInFlight
+    // follows pool depth) -- raise it on devices with memory headroom for smoother
+    // playback; each extra depth is ~one more in-flight frame's worth of activations.
+    const lowMemory = this.hasAttribute("low-memory");
+    const depthAttr = Number(this.getAttribute("pool-depth"));
+    const bufferPoolDepth = Number.isInteger(depthAttr) && depthAttr > 0 ? depthAttr : undefined;
+    this.model = await KumaModel.load(src, { lowMemory, bufferPoolDepth });
+    if (bufferPoolDepth !== undefined) this.log(`pool depth ${bufferPoolDepth}: up to ${bufferPoolDepth} frame(s) in flight`);
+    else if (lowMemory) this.log("low-memory mode: pool depth 1, 1 frame in flight (small buffers pooled)");
     this.gpuRenderer = new GpuFrameRenderer(this.model.gpuDevice, this.canvas);
     this.log(`inputs: ${JSON.stringify(this.model.inputs)}`);
     this.log(`outputs: ${JSON.stringify(this.model.outputs)}`);
@@ -456,7 +485,11 @@ export class KumaPlayer extends HTMLElement {
     this.placeholderEl.style.display = "none";
     this.canvas.style.display = "";
 
-    if (this.hasAttribute("autoplay") && isScalar) this.startPlayback();
+    this.loadInProgress = false;
+    if (isScalar && (this.hasAttribute("autoplay") || this.loadPending)) {
+      this.loadPending = false;
+      this.startPlayback();
+    }
   }
 
   // ── Internal ────────────────────────────────────────────────────────────────
@@ -467,6 +500,8 @@ export class KumaPlayer extends HTMLElement {
   }
 
   private logError(prefix: string, err: unknown): void {
+    this.loadInProgress = false;
+    this.loadPending = false;
     const msg = err instanceof Error ? err.message : String(err);
     this.log(`${prefix}: ${msg}`);
     console.error("[kuma-player]", err);
@@ -495,7 +530,13 @@ export class KumaPlayer extends HTMLElement {
   private togglePlay(): void {
     if (this.playing) {
       this.stopPlayback();
-    } else {
+    } else if (!this.model && !this.loadInProgress) {
+      const src = this.getAttribute("src");
+      if (src) {
+        this.loadPending = true;
+        void this.load(src).catch((err: unknown) => this.logError("Load error", err));
+      }
+    } else if (this.model) {
       this.startPlayback();
     }
   }
@@ -512,11 +553,17 @@ export class KumaPlayer extends HTMLElement {
     requestAnimationFrame((ts) => this.playTick(ts));
   }
 
+  /** In-flight frame cap: the loaded model's real pool depth, or the cold-start default
+   * before one has loaded. A `low-memory` model reports 1 here. */
+  private get maxInFlight(): number {
+    return this.model?.maxInFlight ?? DEFAULT_MAX_IN_FLIGHT;
+  }
+
   private stopPlayback(): void {
     if (this.playing && this.requestedFrames > 0) {
       this.log(
         `Play: ${this.capacityHits}/${this.requestedFrames} frames ` +
-          `(${((100 * this.capacityHits) / this.requestedFrames).toFixed(1)}%) hit MAX_IN_FLIGHT=${MAX_IN_FLIGHT} cap.`,
+          `(${((100 * this.capacityHits) / this.requestedFrames).toFixed(1)}%) hit MAX_IN_FLIGHT=${this.maxInFlight} cap.`,
       );
     }
     this.playing = false;
@@ -530,7 +577,7 @@ export class KumaPlayer extends HTMLElement {
     const name = this.timeInputName;
     if (!m || !name) return;
     this.requestedFrames++;
-    if (this.inFlight >= MAX_IN_FLIGHT) {
+    if (this.inFlight >= this.maxInFlight) {
       this.capacityHits++;
       this.pendingT = t;
       return;
@@ -543,7 +590,7 @@ export class KumaPlayer extends HTMLElement {
 
     void m
       .runToGpu({ [name]: input })
-      .then((outputs) => {
+      .then(async (outputs) => {
         if (seq > this.latestRenderedSequence) {
           this.latestRenderedSequence = seq;
           for (const out of outputs) this.gpuRenderer?.render(out.buffer, out.shape);
@@ -557,7 +604,12 @@ export class KumaPlayer extends HTMLElement {
               `"${outputs[0].name}"  ${JSON.stringify(outputs[0].shape)}`;
           }
         }
-        return m.gpuDevice.queue.onSubmittedWorkDone();
+        await m.gpuDevice.queue.onSubmittedWorkDone();
+        // Output buffers are large (≥ frame size), bypass the pool, and are never
+        // destroyed by the scheduler -- caller owns them. Destroy explicitly now that
+        // both the compute pass that wrote them and the render pass that read them
+        // are confirmed done.
+        for (const out of outputs) out.buffer.destroy();
       })
       .catch((err: unknown) => {
         this.logError(`Error at t=${t.toFixed(3)}`, err);

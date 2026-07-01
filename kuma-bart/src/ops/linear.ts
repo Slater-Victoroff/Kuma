@@ -130,7 +130,7 @@ export function linearHandler(ctx: OpContext): void {
 
   const n = weight.shape[0]!;
   const bias =
-    biasRef === undefined || biasRef === null ? { buffer: ctx.zeros(n * 4), shape: [n] } : ctx.resolve(biasRef);
+    biasRef === undefined || biasRef === null ? { buffer: ctx.getOrCreateZeroBuffer(`zero-bias:${n}`, n * 4), shape: [n] } : ctx.resolve(biasRef);
 
   const result = dispatchLinear(ctx, x, weight, bias);
   const outShape = node.meta.shape ?? result.shape;

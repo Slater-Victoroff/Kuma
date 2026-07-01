@@ -151,7 +151,7 @@ function dispatchConv2d(
   const padH = paddingArg[0]!;
   const padW = paddingArg[1]!;
 
-  const bias = biasRef === null ? { buffer: ctx.zeros(outChannels * 4), shape: [outChannels] } : ctx.resolve(biasRef);
+  const bias = biasRef === null ? { buffer: ctx.getOrCreateZeroBuffer(`zero-bias:${outChannels}`, outChannels * 4), shape: [outChannels] } : ctx.resolve(biasRef);
 
   const inChannelsPerGroup = inChannels / groups;
   if (
