@@ -4,6 +4,7 @@
  * Attributes:
  *   src       path to a .iph package; triggers load when changed
  *   debug     (boolean) show debug panel on mount
+ *   vanilla   (boolean) hide debug/status UI for a plain video-player surface
  *   autoplay  (boolean) start playing immediately after load
  *
  * CSS custom properties (set on the element or a parent):
@@ -17,6 +18,8 @@
 
 import { KumaModel, BUFFER_POOL_DEPTH } from "../index.js";
 import type { VerifyReport, ProfileReport } from "../index.js";
+import { OnnxModel } from "../onnx/model.js";
+import { peekIphFormat } from "../iph/loader.js";
 import { GpuFrameRenderer } from "./gpuRender.js";
 
 // ── Icons ──────────────────────────────────────────────────────────────────────
@@ -207,6 +210,12 @@ canvas {
 }
 .kp-debug.hidden { display: none; }
 
+:host([vanilla]) .kp-status,
+:host([vanilla]) .kp-debug-btn,
+:host([vanilla]) .kp-debug {
+  display: none;
+}
+
 .kp-debug-row {
   display: flex;
   gap: 8px;
@@ -316,7 +325,7 @@ const PROFILE_WARMUP_RUNS = 5;
 // ── KumaPlayer ─────────────────────────────────────────────────────────────────
 
 export class KumaPlayer extends HTMLElement {
-  static readonly observedAttributes = ["src", "debug", "autoplay"];
+  static readonly observedAttributes = ["src", "debug", "vanilla", "autoplay"];
 
   private readonly shadow: ShadowRoot;
 
@@ -336,6 +345,7 @@ export class KumaPlayer extends HTMLElement {
 
   // Playback state
   private model: KumaModel | undefined;
+  private onnxModel: OnnxModel | undefined;
   private gpuRenderer: GpuFrameRenderer | undefined;
   private timeInputName: string | undefined;
   private inFlight = 0;
@@ -390,7 +400,7 @@ export class KumaPlayer extends HTMLElement {
   connectedCallback(): void {
     const src = this.getAttribute("src");
     if (src) void this.load(src).catch((err: unknown) => this.logError("Load error", err));
-    if (this.hasAttribute("debug")) this.setDebugVisible(true);
+    this.syncMode();
   }
 
   attributeChangedCallback(name: string, oldVal: string | null, newVal: string | null): void {
@@ -401,30 +411,71 @@ export class KumaPlayer extends HTMLElement {
     if (name === "debug") {
       this.setDebugVisible(newVal !== null);
     }
+    if (name === "vanilla") {
+      this.syncMode();
+    }
   }
 
   // ── Public API ──────────────────────────────────────────────────────────────
 
   async load(src: string): Promise<void> {
     this.stopPlayback();
+    this.model = undefined;
+    this.onnxModel = undefined;
+    this.gpuRenderer = undefined;
     this.setControlsEnabled(false);
-    this.canvas.style.display = "none";
+    this.resetCanvas();
     this.placeholderEl.textContent = "Loading…";
     this.placeholderEl.style.display = "";
     this.statusEl.textContent = "";
     this.logEl.textContent = `loading ${src}…`;
 
-    this.model = await KumaModel.load(src);
-    this.gpuRenderer = new GpuFrameRenderer(this.model.gpuDevice, this.canvas);
-    this.log(`inputs: ${JSON.stringify(this.model.inputs)}`);
-    this.log(`outputs: ${JSON.stringify(this.model.outputs)}`);
+    // Fetch once so we can peek the format before dispatching to the right model class.
+    const res = await fetch(src);
+    if (!res.ok) throw new Error(`Failed to fetch "${src}": ${res.status} ${res.statusText}`);
+    const bytes = await res.arrayBuffer();
+    const format = peekIphFormat(bytes);
+    const isOnnx = format === "onnx" || format === "onnx-branching";
 
-    const durationSeconds = this.model.playback?.duration_seconds;
+    let inputs: ReadonlyArray<{ name: string; shape?: number[] }>;
+    let outputs: ReadonlyArray<{ name: string; shape?: number[] }>;
+    let durationSeconds: number | undefined;
+
+    if (isOnnx) {
+      this.onnxModel = await OnnxModel.load(bytes, { executionProviders: ["webgpu"] });
+      inputs = this.onnxModel.inputs;
+      outputs = this.onnxModel.outputs;
+      durationSeconds = this.onnxModel.playback?.duration_seconds;
+      this.log(`format: ${format}`);
+      this.log(`inputs: ${JSON.stringify(inputs)}`);
+      this.log(`outputs: ${JSON.stringify(outputs)}`);
+      this.log("compiling shaders…");
+      const t0onnx = performance.now();
+      await this.onnxModel.warmAll((done, total) => {
+        this.log(`  segment ${done}/${total} compiled`);
+      });
+      this.log(`shader compilation done in ${(performance.now() - t0onnx).toFixed(0)}ms.`);
+    } else {
+      this.model = await KumaModel.load(bytes);
+      this.gpuRenderer = new GpuFrameRenderer(this.model.gpuDevice, this.canvas);
+      inputs = this.model.inputs;
+      outputs = this.model.outputs;
+      durationSeconds = this.model.playback?.duration_seconds;
+      this.log(`inputs: ${JSON.stringify(inputs)}`);
+      this.log(`outputs: ${JSON.stringify(outputs)}`);
+
+      this.log("warming up…");
+      const t0 = performance.now();
+      await this.model.warmUp();
+      this.log(`warm-up done in ${(performance.now() - t0).toFixed(0)}ms.`);
+    }
+
     if (durationSeconds !== undefined) {
       this.playSweepMs = durationSeconds * 1000;
+      const playback = isOnnx ? this.onnxModel!.playback : this.model!.playback;
       this.log(
         `playback: ${durationSeconds}s/sweep` +
-          (this.model.playback?.fps !== undefined ? ` @ ${this.model.playback.fps}fps` : "") +
+          (playback?.fps !== undefined ? ` @ ${playback.fps}fps` : "") +
           ` (from .iph metadata)`,
       );
     } else {
@@ -432,21 +483,17 @@ export class KumaPlayer extends HTMLElement {
       this.log(`playback: no duration_seconds — using ${(DEFAULT_PLAY_SWEEP_MS / 1000).toFixed(1)}s default.`);
     }
 
-    this.log("warming up…");
-    const t0 = performance.now();
-    await this.model.warmUp();
-    this.log(`warm-up done in ${(performance.now() - t0).toFixed(0)}ms.`);
-
-    const inputSpec = this.model.inputs[0]!;
-    const n = (inputSpec.shape ?? []).reduce((a, b) => a * b, 1);
+    // shape is often absent for ONNX manifests; default to [1] (scalar time input).
+    const inputSpec = inputs[0]!;
+    const n = (inputSpec.shape ?? [1]).reduce((a, b) => a * b, 1);
     const isScalar = n === 1;
     this.timeInputName = isScalar ? inputSpec.name : undefined;
 
-    this.verifyBtn.disabled = false;
+    if (!isOnnx) this.verifyBtn.disabled = false;
     if (isScalar) {
       this.scrubber.disabled = false;
       this.playBtn.disabled = false;
-      this.profileBtn.disabled = false;
+      if (!isOnnx) this.profileBtn.disabled = false;
       this.log(`scrubbing "${inputSpec.name}" over t ∈ [0, 1].`);
       this.submitFrame(Number(this.scrubber.value));
     } else {
@@ -460,6 +507,43 @@ export class KumaPlayer extends HTMLElement {
   }
 
   // ── Internal ────────────────────────────────────────────────────────────────
+
+  /** Replace the canvas element so the next load always starts with a fresh context.
+   * A canvas can only have one context type (webgpu vs 2d) for its lifetime, so we
+   * must swap it out before switching between KumaModel (WebGPU) and OnnxModel (2D). */
+  private resetCanvas(): void {
+    const fresh = document.createElement("canvas");
+    fresh.className = "kp-canvas";
+    fresh.style.display = "none";
+    this.canvas.replaceWith(fresh);
+    this.canvas = fresh;
+  }
+
+  /** Render a CHW/NCHW Float32Array output to the canvas via the 2D API. */
+  private renderCpuFrame(data: Float32Array, shape: readonly number[]): boolean {
+    const dims = shape.length === 4 ? shape.slice(1) : [...shape];
+    if (dims.length !== 3) return false;
+    const [channels, height, width] = dims as [number, number, number];
+    if (channels !== 1 && channels !== 3) return false;
+    const ctx = this.canvas.getContext("2d");
+    if (!ctx) return false;
+    if (this.canvas.width !== width || this.canvas.height !== height) {
+      this.canvas.width = width;
+      this.canvas.height = height;
+    }
+    const imageData = ctx.createImageData(width, height);
+    const plane = width * height;
+    const px = imageData.data;
+    for (let i = 0; i < plane; i++) {
+      const r = Math.round(Math.max(0, Math.min(1, data[i])) * 255);
+      px[i * 4]     = r;
+      px[i * 4 + 1] = channels >= 2 ? Math.round(Math.max(0, Math.min(1, data[plane + i])) * 255) : r;
+      px[i * 4 + 2] = channels >= 3 ? Math.round(Math.max(0, Math.min(1, data[2 * plane + i])) * 255) : r;
+      px[i * 4 + 3] = 255;
+    }
+    ctx.putImageData(imageData, 0, 0);
+    return true;
+  }
 
   private log(line: string): void {
     this.logEl.textContent += `\n${line}`;
@@ -486,10 +570,24 @@ export class KumaPlayer extends HTMLElement {
     this.timeEl.textContent = t.toFixed(3);
   }
 
+  private formatFps(elapsedMs: number): string {
+    if (elapsedMs <= 0) return "∞fps";
+    return `${(1000 / elapsedMs).toFixed(1)}fps`;
+  }
+
   private setDebugVisible(show: boolean): void {
+    if (show && this.hasAttribute("vanilla")) show = false;
     this.debugVisible = show;
     this.debugPanel.classList.toggle("hidden", !show);
     this.debugBtn.classList.toggle("active", show);
+  }
+
+  private syncMode(): void {
+    if (this.hasAttribute("vanilla")) {
+      this.setDebugVisible(false);
+    } else if (this.hasAttribute("debug")) {
+      this.setDebugVisible(true);
+    }
   }
 
   private togglePlay(): void {
@@ -526,11 +624,14 @@ export class KumaPlayer extends HTMLElement {
 
   /** Submit a frame render at time `t` — latest-wins under the in-flight cap. */
   private submitFrame(t: number): void {
-    const m = this.model;
     const name = this.timeInputName;
-    if (!m || !name) return;
+    if (!name) return;
+
     this.requestedFrames++;
-    if (this.inFlight >= MAX_IN_FLIGHT) {
+    // ONNX InferenceSession.run() is not concurrent-safe on the same session —
+    // limit to 1 in-flight for ONNX, use the full GPU pipeline depth for KumaModel.
+    const maxInFlight = this.onnxModel ? 1 : MAX_IN_FLIGHT;
+    if (this.inFlight >= maxInFlight) {
       this.capacityHits++;
       this.pendingT = t;
       return;
@@ -541,6 +642,44 @@ export class KumaPlayer extends HTMLElement {
     const input = new Float32Array([t]);
     const t0 = performance.now();
 
+    const drain = () => {
+      this.inFlight--;
+      if (this.pendingT !== undefined) {
+        const next = this.pendingT;
+        this.pendingT = undefined;
+        this.submitFrame(next);
+      }
+    };
+
+    if (this.onnxModel) {
+      // ONNX path: inference → 2D canvas rendering.
+      const om = this.onnxModel;
+      const outSpec = om.outputs[0];
+      void om
+        .run({ [name]: input })
+        .then((outputs) => {
+          if (seq > this.latestRenderedSequence) {
+            this.latestRenderedSequence = seq;
+            const outName = outSpec?.name ?? Object.keys(outputs)[0]!;
+            const result = outputs[outName];
+            // shape comes from the real ort tensor dims, not the manifest
+            if (result) this.renderCpuFrame(result.data, result.shape);
+            const elapsed = performance.now() - t0;
+            this.statusEl.textContent =
+              `t=${t.toFixed(3)}  ${this.formatFps(elapsed)}  "${outName}"  ${JSON.stringify(result?.shape ?? "?")}`;
+          }
+        })
+        .catch((err: unknown) => {
+          this.logError(`Error at t=${t.toFixed(3)}`, err);
+          this.stopPlayback();
+        })
+        .finally(drain);
+      return;
+    }
+
+    // KumaModel (WebGPU) path.
+    const m = this.model;
+    if (!m) { drain(); return; }
     void m
       .runToGpu({ [name]: input })
       .then((outputs) => {
@@ -553,7 +692,7 @@ export class KumaPlayer extends HTMLElement {
           }
           if (outputs[0]) {
             this.statusEl.textContent =
-              `t=${t.toFixed(3)}  ${elapsed.toFixed(1)}ms enqueue  ` +
+              `t=${t.toFixed(3)}  ${this.formatFps(elapsed)} enqueue  ` +
               `"${outputs[0].name}"  ${JSON.stringify(outputs[0].shape)}`;
           }
         }
@@ -563,14 +702,7 @@ export class KumaPlayer extends HTMLElement {
         this.logError(`Error at t=${t.toFixed(3)}`, err);
         this.stopPlayback();
       })
-      .finally(() => {
-        this.inFlight--;
-        if (this.pendingT !== undefined) {
-          const next = this.pendingT;
-          this.pendingT = undefined;
-          this.submitFrame(next);
-        }
-      });
+      .finally(drain);
   }
 
   private playTick(nowMs: number): void {

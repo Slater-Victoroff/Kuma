@@ -37,12 +37,32 @@ export const BUFFER_POOL_DEPTH = 3;
  * guard *reuse* safety -- see acquireGenerationSlot. */
 export interface BufferPoolState {
   pools: Map<string, GPUBuffer[]>;
+  byteLengths: Map<string, number>;
+  scratchSlots: ScratchSlot[];
   callGeneration: number;
   confirmedGeneration: number;
 }
 
+export interface ScratchSlot {
+  buffers: GPUBuffer[];
+  byteLengths: Map<GPUBuffer, number>;
+  free: GPUBuffer[];
+  active: Set<GPUBuffer>;
+}
+
 export function createBufferPoolState(): BufferPoolState {
-  return { pools: new Map(), callGeneration: 0, confirmedGeneration: -1 };
+  return {
+    pools: new Map(),
+    byteLengths: new Map(),
+    scratchSlots: Array.from({ length: BUFFER_POOL_DEPTH }, () => ({
+      buffers: [],
+      byteLengths: new Map<GPUBuffer, number>(),
+      free: [],
+      active: new Set<GPUBuffer>(),
+    })),
+    callGeneration: 0,
+    confirmedGeneration: -1,
+  };
 }
 
 /** Call once, before dispatching anything, from every entry point that shares this
@@ -65,6 +85,11 @@ export async function acquireGenerationSlot(device: GPUDevice, pool: BufferPoolS
     await device.queue.onSubmittedWorkDone();
     pool.confirmedGeneration = pool.callGeneration - 1;
   }
+  const slot = pool.scratchSlots[pool.callGeneration % BUFFER_POOL_DEPTH];
+  if (slot) {
+    slot.free = [...slot.buffers];
+    slot.active.clear();
+  }
 }
 
 /** Call once, right after submit, from the same caller as acquireGenerationSlot.
@@ -78,6 +103,17 @@ export function releaseGenerationSlot(device: GPUDevice, pool: BufferPoolState):
   void device.queue.onSubmittedWorkDone().then(() => {
     pool.confirmedGeneration = Math.max(pool.confirmedGeneration, myGeneration);
   });
+}
+
+export function releaseScratchBuffer(pool: BufferPoolState, buffer: GPUBuffer): void {
+  const slot = pool.scratchSlots[pool.callGeneration % BUFFER_POOL_DEPTH];
+  if (!slot || !slot.active.has(buffer)) return;
+  slot.active.delete(buffer);
+  slot.free.push(buffer);
+}
+
+export function isScratchBuffer(pool: BufferPoolState, buffer: GPUBuffer): boolean {
+  return pool.scratchSlots.some((slot) => slot.byteLengths.has(buffer));
 }
 
 /**
@@ -98,6 +134,7 @@ export class OpContext {
   // more than once (e.g. fft.ts's multi-step intermediates), and each call needs its
   // own pool ring, not a shared one.
   private createBufferCallIndex = 0;
+  private readonly createdBuffers: GPUBuffer[] = [];
 
   constructor(
     public readonly device: GPUDevice,
@@ -125,26 +162,47 @@ export class OpContext {
     return tensor;
   }
 
-  /** Returns this call's slot in a BUFFER_POOL_DEPTH-deep ring buffer, keyed by this
-   * node + which createBuffer call this is within it -- sized once (lazily, on first
-   * use) to `shape`'s byte length, safe to reuse forever after since the same node
-   * always produces the same shape on every call (Kuma is a static-shape compiler).
-   * Reuse-timing safety across calls is the scheduler's job (acquireGenerationSlot,
-   * called once per runGraph/profileGraph call before any createBuffer call can
-   * happen) -- by the time this runs, it's already safe to hand back whichever slot
-   * `bufferPool.callGeneration % BUFFER_POOL_DEPTH` points at. */
+  /** Returns a buffer from this in-flight generation's scratch slot. The scheduler
+   * releases buffers back into the slot when their last graph consumer has been encoded,
+   * so independent node outputs reuse memory instead of keeping one persistent ring per
+   * node. Reuse across simultaneously in-flight calls is still separated by
+   * BUFFER_POOL_DEPTH generation slots. */
   createBuffer(shape: readonly number[]): GPUBuffer {
+    this.createBufferCallIndex++;
     const byteLength = numElements(shape) * 4;
-    const key = `${this.node.name}::${this.createBufferCallIndex++}`;
-    let slots = this.bufferPool.pools.get(key);
-    if (!slots) {
-      slots = [];
-      for (let i = 0; i < BUFFER_POOL_DEPTH; i++) {
-        slots.push(createStorageBuffer(this.device, byteLength));
-      }
-      this.bufferPool.pools.set(key, slots);
+    const slot = this.bufferPool.scratchSlots[this.bufferPool.callGeneration % BUFFER_POOL_DEPTH];
+    if (!slot) {
+      const buffer = createStorageBuffer(this.device, byteLength);
+      this.createdBuffers.push(buffer);
+      return buffer;
     }
-    return slots[this.bufferPool.callGeneration % BUFFER_POOL_DEPTH]!;
+
+    let bestIndex = -1;
+    let bestBytes = Number.POSITIVE_INFINITY;
+    for (let i = 0; i < slot.free.length; i++) {
+      const candidate = slot.free[i]!;
+      const candidateBytes = slot.byteLengths.get(candidate) ?? 0;
+      if (candidateBytes >= byteLength && candidateBytes < bestBytes) {
+        bestIndex = i;
+        bestBytes = candidateBytes;
+      }
+    }
+
+    let buffer: GPUBuffer;
+    if (bestIndex >= 0) {
+      buffer = slot.free.splice(bestIndex, 1)[0]!;
+    } else {
+      buffer = createStorageBuffer(this.device, byteLength);
+      slot.buffers.push(buffer);
+      slot.byteLengths.set(buffer, byteLength);
+    }
+    slot.active.add(buffer);
+    this.createdBuffers.push(buffer);
+    return buffer;
+  }
+
+  getCreatedBuffers(): readonly GPUBuffer[] {
+    return this.createdBuffers;
   }
 
   /** A zero-filled buffer of `byteLength` bytes — for bias-less ops (e.g. conv2d/linear with no bias arg). */
@@ -188,14 +246,12 @@ export class OpContext {
   }
 
   /** Pack u32 fields (WGSL struct order) into a ready-to-bind uniform buffer. Cached
-   * forever once built: every field here comes from graph structure (shape, stride,
-   * weight dims, etc. -- see node.meta/args), never from actual input data, so the
-   * exact same buffer is correct on every subsequent call for this node -- rebuilding
-   * it every frame is pure waste, not extra correctness. Safe to cache indefinitely:
-   * never written to again after creation, so there's no multi-frame-in-flight reuse
-   * hazard the way pooled *output* buffers have. */
+   * by value: most fields come from graph structure, but ONNX exports can have concrete
+   * batch-dependent shapes that differ between playback and golden verification for the
+   * same node. The values still are not data-dependent, so caching identical param
+   * payloads remains useful; the payload itself must be part of the key. */
   uniform(fields: readonly number[]): GPUBuffer {
-    const key = `params:${this.node.name}:${this.uniformCallIndex++}`;
+    const key = `params:${this.node.name}:${this.uniformCallIndex++}:${fields.join(",")}`;
     let buffer = this.constantCache.get(key);
     if (!buffer) {
       buffer = createUniformBuffer(this.device, packParams(fields));
@@ -205,9 +261,9 @@ export class OpContext {
   }
 
   /** Like `uniform`, for Params structs that mix u32 and f32 fields (e.g. clamp,
-   * group_norm/layer_norm's eps). Same caching rationale as `uniform`. */
+   * group_norm/layer_norm's eps). Same value-keyed caching rationale as `uniform`. */
   uniformTyped(fields: readonly TypedParamField[]): GPUBuffer {
-    const key = `params:${this.node.name}:${this.uniformCallIndex++}`;
+    const key = `params:${this.node.name}:${this.uniformCallIndex++}:${JSON.stringify(fields)}`;
     let buffer = this.constantCache.get(key);
     if (!buffer) {
       buffer = createUniformBuffer(this.device, packTypedParams(fields));

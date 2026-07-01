@@ -1,11 +1,20 @@
 import type { GraphNode, KumaManifest, NodeRef } from "../types/manifest.js";
-import { OpContext, type ResolvedTensor, createBufferPoolState, acquireGenerationSlot, releaseGenerationSlot } from "./context.js";
+import {
+  OpContext,
+  type ResolvedTensor,
+  createBufferPoolState,
+  acquireGenerationSlot,
+  releaseGenerationSlot,
+  releaseScratchBuffer,
+  isScratchBuffer,
+} from "./context.js";
 import { numElements } from "./shape.js";
 import { opRegistry, findLinearWeightElisions } from "../ops/index.js";
 import { KumaManifestError, KumaUnsupportedOpError } from "../errors.js";
 import { readBuffers } from "../gpu/buffers.js";
 import type { SnippetFn } from "./snippets.js";
-import { resolveSwitches, type RunGraphParams } from "./scheduler.js";
+import { buildRefCounts, collectNodeRefs, resolveSwitches, type RunGraphParams } from "./scheduler.js";
+import { synthesizeWeight } from "./synthetic_weights.js";
 
 export interface OpTiming {
   name: string;
@@ -87,40 +96,50 @@ export async function profileGraph(params: RunGraphParams): Promise<ProfileRepor
   const { nodes, seeded } = resolveSwitches(device, manifest.graph.nodes, rawInputs, snippets, snippetCache);
   const elisions = findLinearWeightElisions(nodes);
   const resolved = new Map<string, ResolvedTensor>(seeded);
+  const refCounts = buildRefCounts(nodes, undefined);
 
-  // Pass 1: resolve placeholders/elided aliases (no GPU work) and collect the nodes that
-  // will actually dispatch a kernel, so the query set can be sized exactly upfront.
+  const bufferStillResolved = (buffer: GPUBuffer): boolean => {
+    for (const tensor of resolved.values()) {
+      if (tensor.buffer === buffer || tensor.imag === buffer) return true;
+    }
+    return false;
+  };
+  const releaseIfUnresolvedScratch = (buffer: GPUBuffer): void => {
+    if (bufferStillResolved(buffer)) return;
+    releaseScratchBuffer(bufferPool, buffer);
+  };
+  const consumeRefs = (node: GraphNode): void => {
+    const refs = new Set<string>();
+    for (const arg of node.args) collectNodeRefs(arg, refs);
+    for (const arg of Object.values(node.kwargs)) collectNodeRefs(arg, refs);
+    for (const ref of refs) {
+      const remaining = (refCounts.get(ref) ?? 0) - 1;
+      refCounts.set(ref, remaining);
+      if (remaining > 0) continue;
+      const tensor = resolved.get(ref);
+      if (!tensor) continue;
+      resolved.delete(ref);
+      releaseIfUnresolvedScratch(tensor.buffer);
+      if (tensor.imag) releaseIfUnresolvedScratch(tensor.imag);
+    }
+  };
+
+  // Pass 1: collect the nodes that will get timed, so the query set can be sized
+  // exactly upfront. Do not resolve aliases here: some elided transposes alias
+  // passthrough nodes that only become resolved when the real graph walk below reaches
+  // them in order.
   const dispatchNodes: GraphNode[] = [];
   let outputNode: GraphNode | undefined;
 
   for (const node of nodes) {
     if (node.op === "placeholder") {
-      if (node.kind === "parameter" || node.kind === "buffer") {
-        const tensor = weightBuffers.get(node.weight_name!);
-        if (!tensor) {
-          throw new KumaManifestError(`Manifest references weight "${node.weight_name}" with no matching entry in weights[].`);
-        }
-        resolved.set(node.name, tensor);
-      } else {
-        const tensor = resolved.get(node.name) ?? inputBuffers.get(node.name);
-        if (!tensor) {
-          throw new KumaManifestError(`Missing input for placeholder "${node.name}" — pass it to KumaModel.run().`);
-        }
-        resolved.set(node.name, tensor);
-      }
       continue;
     }
     if (node.op === "output") {
       outputNode = node;
       continue;
     }
-    const aliasTarget = elisions.get(node.name);
-    if (aliasTarget !== undefined) {
-      const tensor = resolved.get(aliasTarget);
-      if (!tensor) {
-        throw new KumaManifestError(`Internal: elided transpose "${node.name}" aliases "${aliasTarget}" before it was resolved.`);
-      }
-      resolved.set(node.name, tensor);
+    if (elisions.has(node.name)) {
       continue;
     }
     if (!opRegistry.get(node.target)) {
@@ -136,12 +155,44 @@ export async function profileGraph(params: RunGraphParams): Promise<ProfileRepor
   });
 
   const encoder = device.createCommandEncoder();
+  let queryIndex = 0;
 
-  for (let i = 0; i < dispatchNodes.length; i++) {
-    const node = dispatchNodes[i]!;
+  for (const node of nodes) {
+    if (node.op === "placeholder") {
+      if (node.kind === "parameter" || node.kind === "buffer") {
+        const tensor = weightBuffers.get(node.weight_name!)
+          ?? synthesizeWeight(device, constantCache, node.weight_name!, node.meta.shape ?? []);
+        if (!tensor) {
+          throw new KumaManifestError(`Manifest references weight "${node.weight_name}" with no matching entry in weights[].`);
+        }
+        resolved.set(node.name, tensor);
+      } else {
+        const tensor = resolved.get(node.name) ?? inputBuffers.get(node.name);
+        if (!tensor) {
+          throw new KumaManifestError(`Missing input for placeholder "${node.name}" — pass it to KumaModel.run().`);
+        }
+        resolved.set(node.name, tensor);
+      }
+      consumeRefs(node);
+      continue;
+    }
+    if (node.op === "output") {
+      continue;
+    }
+    const aliasTarget = elisions.get(node.name);
+    if (aliasTarget !== undefined) {
+      const tensor = resolved.get(aliasTarget);
+      if (!tensor) {
+        throw new KumaManifestError(`Internal: elided transpose "${node.name}" aliases "${aliasTarget}" before it was resolved.`);
+      }
+      resolved.set(node.name, tensor);
+      consumeRefs(node);
+      continue;
+    }
+
     const handler = opRegistry.get(node.target)!;
     const pass = encoder.beginComputePass({
-      timestampWrites: { querySet, beginningOfPassWriteIndex: i * 2, endOfPassWriteIndex: i * 2 + 1 },
+      timestampWrites: { querySet, beginningOfPassWriteIndex: queryIndex * 2, endOfPassWriteIndex: queryIndex * 2 + 1 },
     });
     const ctx = new OpContext(device, kernels, pipelineCache, pass, resolved, node, constantCache, bufferPool);
     handler(ctx);
@@ -151,9 +202,14 @@ export async function profileGraph(params: RunGraphParams): Promise<ProfileRepor
     if (!isMultiOutput && !resolved.has(node.name)) {
       throw new KumaManifestError(`Internal: op handler for "${node.target}" did not register an output for node "${node.name}".`);
     }
+    consumeRefs(node);
+    for (const buffer of ctx.getCreatedBuffers()) {
+      releaseIfUnresolvedScratch(buffer);
+    }
+    queryIndex++;
   }
 
-  encoder.resolveQuerySet(querySet, 0, dispatchNodes.length * 2, queryBuffer, 0);
+  encoder.resolveQuerySet(querySet, 0, queryIndex * 2, queryBuffer, 0);
   device.queue.submit([encoder.finish()]);
   releaseGenerationSlot(device, bufferPool);
 
@@ -184,14 +240,22 @@ export async function profileGraph(params: RunGraphParams): Promise<ProfileRepor
     keep.add(t.buffer);
     if (t.imag) keep.add(t.imag);
   }
+  for (const buffer of constantCache.values()) {
+    keep.add(buffer);
+  }
   for (const slots of bufferPool.pools.values()) {
     for (const buffer of slots) {
       keep.add(buffer);
     }
   }
+  for (const slot of bufferPool.scratchSlots) {
+    for (const buffer of slot.buffers) {
+      keep.add(buffer);
+    }
+  }
   const destroyed = new Set<GPUBuffer>();
   const destroyIfTemporary = (buffer: GPUBuffer): void => {
-    if (keep.has(buffer) || destroyed.has(buffer)) return;
+    if (keep.has(buffer) || destroyed.has(buffer) || isScratchBuffer(bufferPool, buffer)) return;
     destroyed.add(buffer);
     buffer.destroy();
   };

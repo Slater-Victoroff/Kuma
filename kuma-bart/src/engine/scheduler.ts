@@ -6,12 +6,15 @@ import {
   createBufferPoolState,
   acquireGenerationSlot,
   releaseGenerationSlot,
+  releaseScratchBuffer,
+  isScratchBuffer,
 } from "./context.js";
 import { numElements } from "./shape.js";
 import { opRegistry, findLinearWeightElisions } from "../ops/index.js";
 import { KumaManifestError, KumaUnsupportedOpError } from "../errors.js";
 import { readBuffers, uploadFloat32 } from "../gpu/buffers.js";
 import { getSnippetFn, type SnippetFn } from "./snippets.js";
+import { synthesizeWeight } from "./synthetic_weights.js";
 
 export interface RunGraphParams {
   device: GPUDevice;
@@ -79,6 +82,31 @@ export interface SwitchResolution {
   /** Branch-input bindings, uploaded from JS values — merge into `resolved` before
    * the main loop runs. */
   seeded: Map<string, ResolvedTensor>;
+}
+
+export function collectNodeRefs(arg: ArgValue, into: Set<string>): void {
+  if (isNodeRef(arg)) {
+    into.add(arg.node_ref);
+    return;
+  }
+  if (Array.isArray(arg)) {
+    for (const item of arg) collectNodeRefs(item, into);
+  }
+}
+
+export function buildRefCounts(nodes: readonly GraphNode[], captureNodes: ReadonlySet<string> | undefined): Map<string, number> {
+  const counts = new Map<string, number>();
+  const refs = new Set<string>();
+  for (const node of nodes) {
+    refs.clear();
+    for (const arg of node.args) collectNodeRefs(arg, refs);
+    for (const arg of Object.values(node.kwargs)) collectNodeRefs(arg, refs);
+    for (const ref of refs) counts.set(ref, (counts.get(ref) ?? 0) + 1);
+  }
+  for (const name of captureNodes ?? []) {
+    counts.set(name, (counts.get(name) ?? 0) + 1);
+  }
+  return counts;
 }
 
 /**
@@ -240,6 +268,33 @@ export async function runGraph(params: RunGraphParams): Promise<RunGraphOutput[]
   const { nodes, seeded } = resolveSwitches(device, manifest.graph.nodes, rawInputs, snippets, snippetCache);
   const elisions = findLinearWeightElisions(nodes);
   const resolved = new Map<string, ResolvedTensor>(seeded);
+  const refCounts = buildRefCounts(nodes, params.captureNodes);
+
+  const bufferStillResolved = (buffer: GPUBuffer): boolean => {
+    for (const tensor of resolved.values()) {
+      if (tensor.buffer === buffer || tensor.imag === buffer) return true;
+    }
+    return false;
+  };
+  const releaseIfUnresolvedScratch = (buffer: GPUBuffer): void => {
+    if (bufferStillResolved(buffer)) return;
+    releaseScratchBuffer(bufferPool, buffer);
+  };
+  const consumeRefs = (node: GraphNode): void => {
+    const refs = new Set<string>();
+    for (const arg of node.args) collectNodeRefs(arg, refs);
+    for (const arg of Object.values(node.kwargs)) collectNodeRefs(arg, refs);
+    for (const ref of refs) {
+      const remaining = (refCounts.get(ref) ?? 0) - 1;
+      refCounts.set(ref, remaining);
+      if (remaining > 0) continue;
+      const tensor = resolved.get(ref);
+      if (!tensor) continue;
+      resolved.delete(ref);
+      releaseIfUnresolvedScratch(tensor.buffer);
+      if (tensor.imag) releaseIfUnresolvedScratch(tensor.imag);
+    }
+  };
 
   // Diagnostic: a GPU-side timestamp pair around the *whole* shared pass, to settle
   // directly (no CPU-side ambiguity) whether the shared pass's own GPU execution time
@@ -258,7 +313,8 @@ export async function runGraph(params: RunGraphParams): Promise<RunGraphOutput[]
   for (const node of nodes) {
     if (node.op === "placeholder") {
       if (node.kind === "parameter" || node.kind === "buffer") {
-        const tensor = weightBuffers.get(node.weight_name!);
+        const tensor = weightBuffers.get(node.weight_name!)
+          ?? synthesizeWeight(device, constantCache, node.weight_name!, node.meta.shape ?? []);
         if (!tensor) {
           throw new KumaManifestError(
             `Manifest references weight "${node.weight_name}" with no matching entry in weights[].`,
@@ -272,6 +328,7 @@ export async function runGraph(params: RunGraphParams): Promise<RunGraphOutput[]
         }
         resolved.set(node.name, tensor);
       }
+      consumeRefs(node);
       continue;
     }
 
@@ -290,6 +347,7 @@ export async function runGraph(params: RunGraphParams): Promise<RunGraphOutput[]
         );
       }
       resolved.set(node.name, tensor);
+      consumeRefs(node);
       continue;
     }
 
@@ -308,6 +366,11 @@ export async function runGraph(params: RunGraphParams): Promise<RunGraphOutput[]
       throw new KumaManifestError(
         `Internal: op handler for "${node.target}" did not register an output for node "${node.name}".`,
       );
+    }
+
+    consumeRefs(node);
+    for (const buffer of ctx.getCreatedBuffers()) {
+      releaseIfUnresolvedScratch(buffer);
     }
   }
 
@@ -361,6 +424,9 @@ export async function runGraph(params: RunGraphParams): Promise<RunGraphOutput[]
 
   const tensorsToRead = params.skipOutputReadback ? capturedTensors : [...outputTensors, ...capturedTensors];
   const reads = tensorsToRead.flatMap((tensor) => {
+    if (tensor.shape.some((d) => !Number.isFinite(d) || d < 0)) {
+      throw new KumaManifestError(`Cannot read back tensor with unresolved shape ${JSON.stringify(tensor.shape)}.`);
+    }
     const byteLength = numElements(tensor.shape) * 4;
     const entries = [{ buffer: tensor.buffer, byteLength }];
     if (tensor.imag) entries.push({ buffer: tensor.imag, byteLength });
@@ -407,8 +473,16 @@ export async function runGraph(params: RunGraphParams): Promise<RunGraphOutput[]
     keep.add(t.buffer);
     if (t.imag) keep.add(t.imag);
   }
+  for (const buffer of constantCache.values()) {
+    keep.add(buffer);
+  }
   for (const slots of bufferPool.pools.values()) {
     for (const buffer of slots) {
+      keep.add(buffer);
+    }
+  }
+  for (const slot of bufferPool.scratchSlots) {
+    for (const buffer of slot.buffers) {
       keep.add(buffer);
     }
   }
@@ -418,7 +492,7 @@ export async function runGraph(params: RunGraphParams): Promise<RunGraphOutput[]
   }
   const destroyed = new Set<GPUBuffer>();
   const destroyIfTemporary = (buffer: GPUBuffer): void => {
-    if (keep.has(buffer) || destroyed.has(buffer)) return;
+    if (keep.has(buffer) || destroyed.has(buffer) || isScratchBuffer(bufferPool, buffer)) return;
     destroyed.add(buffer);
     buffer.destroy();
   };
